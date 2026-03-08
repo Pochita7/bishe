@@ -1,0 +1,47 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ===== Virtual Environment =====
+.venv/
+
+# ===== Third-party Frameworks (cloned repos, not our code) =====
+agent-framework/
+autogen/
+crewAI/
+MetaGPT/
+owl/
+
+# ===== Work/Cache directories =====
+gaia_work_dir/
+gaia_data/_hf_cache/
+ffmpeg_bin/
+
+# ===== Backup =====
+gaia_solver_autogen_backup/
+*.bak_*
+
+# ===== Documents (thesis/reports - not code) =====
+*.docx
+*.pdf
+*.pptx
+*.doc
+*.rar
+~$*
+写作指南.doc
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== OS =====
+Thumbs.db
+.DS_Store
+desktop.ini
