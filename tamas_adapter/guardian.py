@@ -165,6 +165,7 @@ class Guardian:
         self._event_sink = event_sink
         # 可选运行时策略回调：用于 Sentinel 控制面进行前置阻断
         self._runtime_policy_callback = runtime_policy_callback
+        self._current_task_id = ""
 
         # ====== 策略配置 ======
 
@@ -800,7 +801,7 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
         此方法由工具 wrapper 在实际执行前调用。
         """
         self.log.total_checks += 1
-        args = args or {}
+        args = self._with_task_context(args)
 
         runtime_decision = self._check_runtime_policy(
             source=source_agent,
@@ -1094,6 +1095,16 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
         """Set or replace a runtime policy callback for pre-execution blocking decisions."""
         self._runtime_policy_callback = runtime_policy_callback
 
+    def set_current_task_id(self, task_id: str) -> None:
+        """Attach Guardian decisions to the current benchmark/session id."""
+        self._current_task_id = task_id or ""
+
+    def _with_task_context(self, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        enriched = dict(params or {})
+        if self._current_task_id and not enriched.get("task_id"):
+            enriched["task_id"] = self._current_task_id
+        return enriched
+
     def _check_runtime_policy(
         self,
         source: str,
@@ -1104,6 +1115,7 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
     ) -> Optional[GuardianDecision]:
         if self._runtime_policy_callback is None:
             return None
+        params = self._with_task_context(params)
 
         try:
             directive = self._runtime_policy_callback(source, target, behavior_type, params or {})
@@ -1136,6 +1148,8 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
     ) -> None:
         """记录 Guardian 决策，并将结构化事件推送给外部 Sentinel。"""
         self.log.decisions.append(decision)
+        event_params = self._with_task_context(params)
+        event_task_id = str(event_params.get("task_id") or self._current_task_id or "")
 
         if self._event_sink is None:
             return
@@ -1145,12 +1159,13 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
             "source_agent": source,
             "target": target,
             "behavior_type": behavior_type,
-            "params": params or {},
+            "params": event_params,
             "gate": decision.gate,
             "decision": decision.action.value,
             "reason": decision.reason,
             "matched_rules": list(decision.matched_rules),
             "scenario": self.scenario,
+            "task_id": event_task_id,
         }
         try:
             self._event_sink(event)

@@ -78,6 +78,7 @@ class MASTeam:
         self.max_tool_calls_per_worker = max_tool_calls_per_worker
         self.security_event_bus = security_event_bus
         self.sentinel_control_plane = sentinel_control_plane
+        self._current_task_id = ""
 
         # ---- 构建 Agent 信息摘要 ----
         self._agent_info = self._build_agent_info(workers)
@@ -126,17 +127,22 @@ class MASTeam:
     ) -> None:
         if self.security_event_bus is None:
             return
+        event_params = dict(params or {})
+        event_task_id = str(event_params.get("task_id") or self._current_task_id or "")
+        if event_task_id and not event_params.get("task_id"):
+            event_params["task_id"] = event_task_id
         self.security_event_bus.publish(
             {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "source_agent": source_agent,
                 "target": target,
                 "behavior_type": behavior_type,
-                "params": dict(params or {}),
+                "params": event_params,
                 "gate": gate,
                 "decision": decision,
                 "reason": reason,
                 "matched_rules": list(matched_rules or []),
+                "task_id": event_task_id,
             }
         )
 
@@ -151,6 +157,8 @@ class MASTeam:
         enforce: bool = True,
     ) -> Optional[Dict[str, Any]]:
         safe_params = dict(params or {})
+        if self._current_task_id and "task_id" not in safe_params:
+            safe_params["task_id"] = self._current_task_id
         self._publish_security_event(
             source_agent=source_agent,
             target=target,
@@ -590,6 +598,10 @@ class MASTeam:
             }
         """
         start = time.time()
+        self._current_task_id = task_id or f"session-{int(start * 1000)}"
+        guardian = getattr(self, "guardian", None)
+        if guardian is not None and hasattr(guardian, "set_current_task_id"):
+            guardian.set_current_task_id(self._current_task_id)
         history: List[Dict[str, str]] = []
         final_answer = ""
         planner_rounds = 0

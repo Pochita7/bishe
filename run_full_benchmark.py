@@ -120,11 +120,20 @@ def load_results(path: str) -> List[dict]:
     return results
 
 
-def make_sentinel_kwargs(prefix: str, bootstrap_events: int = 24) -> Dict[str, Any]:
+def make_sentinel_kwargs(
+    prefix: str,
+    bootstrap_events: int = 24,
+    realtime_window_seconds: int = 120,
+    scope_realtime_by_task: bool = True,
+) -> Dict[str, Any]:
     return {
         "behavior_db_path": f"{prefix}_sentinel_behavior_db.jsonl",
         "assessment_log_path": f"{prefix}_sentinel_assessments.jsonl",
         "bootstrap_events": bootstrap_events,
+        # Benchmark safety: realtime spike windows are scoped by task/session,
+        # while the persisted vector DB still keeps cross-task baseline memory.
+        "scope_realtime_by_task": scope_realtime_by_task,
+        "realtime_window_seconds": realtime_window_seconds,
     }
 
 
@@ -307,8 +316,9 @@ async def run_tamas_single(
     metrics_dict = {}
 
     try:
+        sentinel_task_id = f"{task_id}:{mode}" if use_sentinel else task_id
         result = await asyncio.wait_for(
-            team.run(task=prompt, task_id=task_id),
+            team.run(task=prompt, task_id=sentinel_task_id),
             timeout=TAMAS_TIMEOUT,
         )
         predicted = result.get("answer", "NO_ANSWER") or "NO_ANSWER"
@@ -718,7 +728,12 @@ async def main_async(args):
     # ---- GAIA 测试 ----
     if not args.only_tamas:
         tasks = load_gaia_tasks()
-        gaia_sentinel_kwargs = make_sentinel_kwargs("gaia", args.sentinel_bootstrap_events)
+        gaia_sentinel_kwargs = make_sentinel_kwargs(
+            "gaia",
+            args.sentinel_bootstrap_events,
+            args.sentinel_window_seconds,
+            not args.sentinel_global_realtime,
+        )
         print(f"\n[GAIA] Level 1: {len(tasks)} 题 × 2 轮 (Baseline + Defended)")
 
         # Phase 1: Baseline
@@ -740,7 +755,12 @@ async def main_async(args):
     # ---- TAMAS 测试 ----
     if not args.only_gaia:
         all_data = load_all_tamas()
-        tamas_sentinel_kwargs = make_sentinel_kwargs("tamas", args.sentinel_bootstrap_events)
+        tamas_sentinel_kwargs = make_sentinel_kwargs(
+            "tamas",
+            args.sentinel_bootstrap_events,
+            args.sentinel_window_seconds,
+            not args.sentinel_global_realtime,
+        )
 
         # 每种攻击类型取 N 条
         if args.tamas_per_attack > 0:
@@ -791,6 +811,10 @@ def main():
     parser.add_argument("--with-sentinel", action="store_true", help="额外运行 Guardian+Sentinel 对照实验")
     parser.add_argument("--sentinel-bootstrap-events", type=int, default=24,
                         help="Sentinel 切换到监控模式前需要吸收的基线事件数")
+    parser.add_argument("--sentinel-window-seconds", type=int, default=120,
+                        help="Sentinel realtime window per task/session (default: 120)")
+    parser.add_argument("--sentinel-global-realtime", action="store_true",
+                        help="Use global Sentinel realtime windows instead of task-scoped isolation")
     parser.add_argument("--quiet", action="store_true", help="安静模式")
     parser.add_argument("--report-only", action="store_true", help="只输出已有结果的对比报告")
 

@@ -41,20 +41,29 @@ class SecurityEvent:
     reason: str = ""
     matched_rules: Optional[List[str]] = None
     scenario: str = ""
+    task_id: str = ""
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "SecurityEvent":
+        params = dict(payload.get("params") or {})
+        task_id = (
+            payload.get("task_id")
+            or params.get("task_id")
+            or params.get("session_id")
+            or ""
+        )
         return cls(
             timestamp=payload.get("timestamp") or datetime.now(timezone.utc).isoformat(),
             source_agent=payload.get("source_agent", "unknown"),
             target=payload.get("target", "unknown"),
             behavior_type=payload.get("behavior_type", "unknown"),
-            params=dict(payload.get("params") or {}),
+            params=params,
             gate=payload.get("gate", "UnknownGate"),
             decision=payload.get("decision", "allow"),
             reason=payload.get("reason", ""),
             matched_rules=list(payload.get("matched_rules") or []),
             scenario=payload.get("scenario", ""),
+            task_id=str(task_id),
         )
 
 
@@ -84,6 +93,7 @@ class HitlTicket:
     status: str = "pending"
     reason: str = ""
     notes: str = ""
+    task_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -99,12 +109,16 @@ class SecurityControlPlane:
         self.blocked_tools: set[str] = set()
         self.quarantined_agents: set[str] = set()
         self.paused_agents: set[str] = set()  # HITL pending
+        self.blocked_tools_by_task: Dict[str, set[str]] = defaultdict(set)
+        self.quarantined_agents_by_task: Dict[str, set[str]] = defaultdict(set)
+        self.paused_agents_by_task: Dict[str, set[str]] = defaultdict(set)
         self._hitl_tickets: Dict[str, HitlTicket] = {}
         self._alerts: List[Dict[str, Any]] = []
 
     def apply_assessment(self, assessment: "SentinelAssessment") -> None:
         event = assessment.event
         action = assessment.action
+        task_id = self._event_task_id(event)
 
         if action in {
             SentinelAction.ALERT,
@@ -120,20 +134,21 @@ class SecurityControlPlane:
                     "behavior_type": event.behavior_type,
                     "risk_score": assessment.risk_score,
                     "action": action.value,
+                    "task_id": task_id,
                     "reasons": list(assessment.reasons),
                 }
             )
 
         if action == SentinelAction.BLOCK:
+            self._block_agent(event.source_agent, task_id)
             if event.behavior_type == "tool_call":
-                self.blocked_tools.add(event.target)
-            self.quarantined_agents.add(event.source_agent)
+                self._block_tool(event.target, task_id)
 
         elif action == SentinelAction.QUARANTINE:
-            self.quarantined_agents.add(event.source_agent)
+            self._block_agent(event.source_agent, task_id)
 
         elif action == SentinelAction.HITL:
-            self.paused_agents.add(event.source_agent)
+            self._pause_agent(event.source_agent, task_id)
             tid = self._make_ticket_id(event)
             self._hitl_tickets[tid] = HitlTicket(
                 ticket_id=tid,
@@ -143,6 +158,7 @@ class SecurityControlPlane:
                 behavior_type=event.behavior_type,
                 risk_score=assessment.risk_score,
                 reason="; ".join(assessment.reasons[:3]),
+                task_id=task_id,
             )
 
     def get_runtime_directive(
@@ -154,15 +170,16 @@ class SecurityControlPlane:
     ) -> Optional[Dict[str, Any]]:
         """Return None to allow, or a blocking directive dict."""
         params = params or {}
+        task_id = str(params.get("task_id") or params.get("session_id") or "")
 
-        if source_agent in self.paused_agents:
+        if self._agent_is_paused(source_agent, task_id):
             return {
                 "action": "block",
                 "reason": f"HITL pending for agent '{source_agent}'",
                 "matched_rules": ["SENTINEL_HITL_PENDING"],
             }
 
-        if source_agent in self.quarantined_agents and behavior_type in {
+        if self._agent_is_quarantined(source_agent, task_id) and behavior_type in {
             "tool_call",
             "agent_message",
             "plan_review",
@@ -177,7 +194,7 @@ class SecurityControlPlane:
                 "matched_rules": ["SENTINEL_QUARANTINE"],
             }
 
-        if behavior_type == "tool_call" and target in self.blocked_tools:
+        if behavior_type == "tool_call" and self._tool_is_blocked(target, task_id):
             return {
                 "action": "block",
                 "reason": f"Tool '{target}' is blocked by Sentinel",
@@ -204,10 +221,10 @@ class SecurityControlPlane:
         ticket.notes = notes
 
         if approve:
-            self.paused_agents.discard(ticket.source_agent)
+            self._discard_paused_agent(ticket.source_agent, ticket.task_id)
         else:
-            self.paused_agents.discard(ticket.source_agent)
-            self.quarantined_agents.add(ticket.source_agent)
+            self._discard_paused_agent(ticket.source_agent, ticket.task_id)
+            self._block_agent(ticket.source_agent, ticket.task_id)
 
         return True
 
@@ -228,14 +245,102 @@ class SecurityControlPlane:
             "blocked_tools": sorted(self.blocked_tools),
             "quarantined_agents": sorted(self.quarantined_agents),
             "paused_agents": sorted(self.paused_agents),
+            "task_scoped_blocked_tools": {
+                tid: sorted(values)
+                for tid, values in sorted(self.blocked_tools_by_task.items())
+                if values
+            },
+            "task_scoped_quarantined_agents": {
+                tid: sorted(values)
+                for tid, values in sorted(self.quarantined_agents_by_task.items())
+                if values
+            },
+            "task_scoped_paused_agents": {
+                tid: sorted(values)
+                for tid, values in sorted(self.paused_agents_by_task.items())
+                if values
+            },
             "pending_hitl_tickets": len(self.list_hitl_tickets()),
             "alert_count": len(self._alerts),
         }
 
     def _make_ticket_id(self, event: "SecurityEvent") -> str:
-        raw = f"{event.timestamp}|{event.source_agent}|{event.target}|{event.behavior_type}"
+        raw = f"{event.task_id}|{event.timestamp}|{event.source_agent}|{event.target}|{event.behavior_type}"
         digest = blake2b(raw.encode("utf-8"), digest_size=5).hexdigest()
         return f"hitl-{digest}"
+
+    def reset_runtime_state(self, task_id: Optional[str] = None) -> None:
+        """Clear active enforcement state globally or for one benchmark task."""
+        if task_id:
+            self.blocked_tools_by_task.pop(task_id, None)
+            self.quarantined_agents_by_task.pop(task_id, None)
+            self.paused_agents_by_task.pop(task_id, None)
+            self._hitl_tickets = {
+                tid: ticket
+                for tid, ticket in self._hitl_tickets.items()
+                if ticket.task_id != task_id
+            }
+            return
+
+        self.blocked_tools.clear()
+        self.quarantined_agents.clear()
+        self.paused_agents.clear()
+        self.blocked_tools_by_task.clear()
+        self.quarantined_agents_by_task.clear()
+        self.paused_agents_by_task.clear()
+        self._hitl_tickets.clear()
+
+    @staticmethod
+    def _event_task_id(event: "SecurityEvent") -> str:
+        return str(
+            event.task_id
+            or (event.params or {}).get("task_id")
+            or (event.params or {}).get("session_id")
+            or ""
+        )
+
+    @staticmethod
+    def _task_set(mapping: Dict[str, set[str]], task_id: str) -> set[str]:
+        return mapping[task_id]
+
+    def _block_agent(self, agent: str, task_id: str) -> None:
+        if task_id:
+            self._task_set(self.quarantined_agents_by_task, task_id).add(agent)
+        else:
+            self.quarantined_agents.add(agent)
+
+    def _block_tool(self, tool: str, task_id: str) -> None:
+        if task_id:
+            self._task_set(self.blocked_tools_by_task, task_id).add(tool)
+        else:
+            self.blocked_tools.add(tool)
+
+    def _pause_agent(self, agent: str, task_id: str) -> None:
+        if task_id:
+            self._task_set(self.paused_agents_by_task, task_id).add(agent)
+        else:
+            self.paused_agents.add(agent)
+
+    def _discard_paused_agent(self, agent: str, task_id: str) -> None:
+        if task_id:
+            self.paused_agents_by_task.get(task_id, set()).discard(agent)
+        else:
+            self.paused_agents.discard(agent)
+
+    def _agent_is_quarantined(self, agent: str, task_id: str) -> bool:
+        if agent in self.quarantined_agents:
+            return True
+        return bool(task_id and agent in self.quarantined_agents_by_task.get(task_id, set()))
+
+    def _agent_is_paused(self, agent: str, task_id: str) -> bool:
+        if agent in self.paused_agents:
+            return True
+        return bool(task_id and agent in self.paused_agents_by_task.get(task_id, set()))
+
+    def _tool_is_blocked(self, tool: str, task_id: str) -> bool:
+        if tool in self.blocked_tools:
+            return True
+        return bool(task_id and tool in self.blocked_tools_by_task.get(task_id, set()))
 
 
 class LocalVectorBehaviorStore:
@@ -371,6 +476,7 @@ class SentinelAgent:
         realtime_window_seconds: int = 120,
         bootstrap_events: int = 12,
         start_in_learning_mode: Optional[bool] = None,
+        scope_realtime_by_task: bool = True,
         threshold_alert: float = 45.0,
         threshold_block: float = 65.0,
         threshold_quarantine: float = 80.0,
@@ -385,6 +491,7 @@ class SentinelAgent:
         self.baseline_similarity_threshold = baseline_similarity_threshold
         self.realtime_window_seconds = realtime_window_seconds
         self.bootstrap_events = max(0, int(bootstrap_events))
+        self.scope_realtime_by_task = scope_realtime_by_task
 
         self._baseline_pattern_count = len(self.vector_db)
         self.learning_mode = (
@@ -394,10 +501,11 @@ class SentinelAgent:
         )
         self._learned_events = 0
         self.quarantined_agents: set[str] = set()
+        self._quarantined_agents_by_scope: Dict[str, set[str]] = defaultdict(set)
 
-        self._pair_history: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
-        self._tool_history: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
-        self._behavior_history: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
+        self._pair_history: Dict[Tuple[str, str, str], Deque[float]] = defaultdict(deque)
+        self._tool_history: Dict[Tuple[str, str, str], Deque[float]] = defaultdict(deque)
+        self._behavior_history: Dict[Tuple[str, str, str], Deque[float]] = defaultdict(deque)
         self._pair_baseline: Dict[Tuple[str, str], int] = defaultdict(int)
         self._tool_baseline: Dict[Tuple[str, str], int] = defaultdict(int)
         self._behavior_baseline: Dict[Tuple[str, str], int] = defaultdict(int)
@@ -486,12 +594,13 @@ class SentinelAgent:
         reasons: List[str] = []
         anomalies: List[str] = []
         score = 0.0
+        scope = self._scope_key(event)
 
         # Quarantine enforcement comes first.
-        if event.source_agent in self.quarantined_agents and event.behavior_type in {"tool_call", "agent_message"}:
+        if self._is_agent_quarantined(event.source_agent, scope) and event.behavior_type in {"tool_call", "agent_message"}:
             score = max(score, 85.0)
             anomalies.append("quarantined_agent_activity")
-            reasons.append(f"agent '{event.source_agent}' is quarantined")
+            reasons.append(f"agent '{event.source_agent}' is quarantined in scope '{scope}'")
 
         # 1) Baseline similarity via vector retrieval.
         nearest = self.vector_db.query_similar(event, top_k=1, labels=["baseline"])
@@ -561,11 +670,11 @@ class SentinelAgent:
         action = self._map_action(score)
 
         if action == SentinelAction.QUARANTINE:
-            self.quarantined_agents.add(event.source_agent)
-            reasons.append(f"agent '{event.source_agent}' moved to quarantine")
+            self._quarantine_agent(event.source_agent, scope)
+            reasons.append(f"agent '{event.source_agent}' moved to quarantine in scope '{scope}'")
         elif action == SentinelAction.HITL:
-            self.quarantined_agents.add(event.source_agent)
-            reasons.append("human review required before resuming")
+            self._quarantine_agent(event.source_agent, scope)
+            reasons.append(f"human review required before resuming scope '{scope}'")
 
         return SentinelAssessment(
             event=event,
@@ -587,7 +696,9 @@ class SentinelAgent:
         return SentinelAction.ALLOW
 
     def _score_pair_spike(self, event: SecurityEvent) -> Tuple[float, str]:
-        pair_key = (event.source_agent, event.target)
+        scope = self._scope_key(event)
+        pair_key = (scope, event.source_agent, event.target)
+        baseline_key = (event.source_agent, event.target)
         if event.behavior_type not in {"agent_message", "plan_review", "tool_call"}:
             return 0.0, ""
 
@@ -595,29 +706,31 @@ class SentinelAgent:
         history = self._pair_history[pair_key]
         self._trim_window(history, now)
         current_count = len(history)
-        baseline = self._pair_baseline.get(pair_key, 0)
+        baseline = self._pair_baseline.get(baseline_key, 0)
 
         if baseline == 0 and current_count >= 3:
-            return 20.0, f"new pair '{event.source_agent}->{event.target}' became frequent"
+            return 20.0, f"new pair '{event.source_agent}->{event.target}' became frequent in scope '{scope}'"
         if baseline > 0 and current_count >= max(6, min(8, baseline + 2)):
-            return 12.0, f"pair '{event.source_agent}->{event.target}' frequency spiked"
+            return 12.0, f"pair '{event.source_agent}->{event.target}' frequency spiked in scope '{scope}'"
         return 0.0, ""
 
     def _score_tool_spike(self, event: SecurityEvent) -> Tuple[float, str]:
         if event.behavior_type != "tool_call":
             return 0.0, ""
 
-        key = (event.source_agent, event.target)
+        scope = self._scope_key(event)
+        key = (scope, event.source_agent, event.target)
+        baseline_key = (event.source_agent, event.target)
         now = self._event_ts(event)
         history = self._tool_history[key]
         self._trim_window(history, now)
         current_count = len(history)
-        baseline = self._tool_baseline.get(key, 0)
+        baseline = self._tool_baseline.get(baseline_key, 0)
 
         if baseline == 0 and current_count >= 3:
-            return 25.0, f"rare tool '{event.target}' called repeatedly by '{event.source_agent}'"
+            return 25.0, f"rare tool '{event.target}' called repeatedly by '{event.source_agent}' in scope '{scope}'"
         if baseline > 0 and current_count >= max(6, min(10, baseline + 2)):
-            return 15.0, f"tool '{event.target}' call rate unusually high"
+            return 15.0, f"tool '{event.target}' call rate unusually high in scope '{scope}'"
         return 0.0, ""
 
     def _score_behavior_spike(self, event: SecurityEvent) -> Tuple[float, str]:
@@ -632,22 +745,24 @@ class SentinelAgent:
         }:
             return 0.0, ""
 
-        key = (event.source_agent, event.behavior_type)
+        scope = self._scope_key(event)
+        key = (scope, event.source_agent, event.behavior_type)
+        baseline_key = (event.source_agent, event.behavior_type)
         now = self._event_ts(event)
         history = self._behavior_history[key]
         self._trim_window(history, now)
         current_count = len(history)
-        baseline = self._behavior_baseline.get(key, 0)
+        baseline = self._behavior_baseline.get(baseline_key, 0)
 
         if baseline == 0 and current_count >= 3:
             return 18.0, (
                 f"behavior '{event.behavior_type}' became frequent for "
-                f"'{event.source_agent}' without baseline"
+                f"'{event.source_agent}' without baseline in scope '{scope}'"
             )
         if baseline > 0 and current_count >= max(6, min(9, baseline + 2)):
             return 10.0, (
                 f"behavior '{event.behavior_type}' rate spiked for "
-                f"'{event.source_agent}'"
+                f"'{event.source_agent}' in scope '{scope}'"
             )
         return 0.0, ""
 
@@ -668,19 +783,20 @@ class SentinelAgent:
 
     def _update_histories(self, event: SecurityEvent) -> None:
         now = self._event_ts(event)
+        scope = self._scope_key(event)
 
-        pair_key = (event.source_agent, event.target)
+        pair_key = (scope, event.source_agent, event.target)
         pair_history = self._pair_history[pair_key]
         pair_history.append(now)
         self._trim_window(pair_history, now)
 
         if event.behavior_type == "tool_call":
-            tool_key = (event.source_agent, event.target)
+            tool_key = (scope, event.source_agent, event.target)
             tool_history = self._tool_history[tool_key]
             tool_history.append(now)
             self._trim_window(tool_history, now)
 
-        behavior_key = (event.source_agent, event.behavior_type)
+        behavior_key = (scope, event.source_agent, event.behavior_type)
         behavior_history = self._behavior_history[behavior_key]
         behavior_history.append(now)
         self._trim_window(behavior_history, now)
@@ -695,6 +811,51 @@ class SentinelAgent:
             return dt.timestamp()
         except ValueError:
             return time.time()
+
+    def _scope_key(self, event: SecurityEvent) -> str:
+        if not self.scope_realtime_by_task:
+            return "global"
+        return str(
+            event.task_id
+            or (event.params or {}).get("task_id")
+            or (event.params or {}).get("session_id")
+            or "global"
+        )
+
+    def _is_agent_quarantined(self, agent: str, scope: str) -> bool:
+        if agent in self.quarantined_agents:
+            return True
+        return agent in self._quarantined_agents_by_scope.get(scope, set())
+
+    def _quarantine_agent(self, agent: str, scope: str) -> None:
+        if self.scope_realtime_by_task and scope != "global":
+            self._quarantined_agents_by_scope[scope].add(agent)
+        else:
+            self.quarantined_agents.add(agent)
+
+    def reset_runtime_state(self, scope: Optional[str] = None) -> None:
+        """Clear short-term histories and active Sentinel quarantines.
+
+        Baseline/RAG memory is intentionally preserved; this is for benchmark
+        session isolation, not for deleting learned patterns.
+        """
+        if scope:
+            for mapping in (self._pair_history, self._tool_history, self._behavior_history):
+                for key in list(mapping.keys()):
+                    if key[0] == scope:
+                        del mapping[key]
+            self._quarantined_agents_by_scope.pop(scope, None)
+            if self._control_plane is not None:
+                self._control_plane.reset_runtime_state(task_id=scope)
+            return
+
+        self._pair_history.clear()
+        self._tool_history.clear()
+        self._behavior_history.clear()
+        self.quarantined_agents.clear()
+        self._quarantined_agents_by_scope.clear()
+        if self._control_plane is not None:
+            self._control_plane.reset_runtime_state()
 
     def _log_assessment(self, assessment: SentinelAssessment) -> None:
         self.assessment_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -717,7 +878,20 @@ class SentinelAgent:
             "mode": "learning" if self.learning_mode else "monitoring",
             "learned_events": self._learned_events,
             "baseline_patterns": self._baseline_pattern_count,
+            "history_scope": "task" if self.scope_realtime_by_task else "global",
+            "runtime_scopes": sorted(
+                {
+                    key[0]
+                    for mapping in (self._pair_history, self._tool_history, self._behavior_history)
+                    for key in mapping.keys()
+                }
+            ),
             "quarantined_agents": sorted(self.quarantined_agents),
+            "task_scoped_quarantined_agents": {
+                scope: sorted(values)
+                for scope, values in sorted(self._quarantined_agents_by_scope.items())
+                if values
+            },
             "behavior_db_path": str(self.vector_db.db_path),
             "assessment_log_path": str(self.assessment_log_path),
             "pending_hitl_tickets": len(self._control_plane.list_hitl_tickets()) if self._control_plane else 0,
