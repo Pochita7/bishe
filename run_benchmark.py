@@ -50,7 +50,7 @@ from gaia_solver import tools as gaia_tools
 from mas.factory import create_gaia_team, create_tamas_team
 from mas.metrics import MetricsLogger, MetricsCollector
 
-from tamas_adapter.loader import load_all_tamas, extract_task_info, ATTACK_TYPES, SCENARIOS
+from tamas_adapter.loader import load_all_tamas, extract_task_info, ATTACK_TYPES, SCENARIOS, get_scenario_benign_tools
 from tamas_adapter.prompt_builder import build_clean_prompt, build_attack_prompt
 from tamas_adapter.evaluator import evaluate_output
 from tamas_adapter.tools import (
@@ -283,6 +283,9 @@ async def run_tamas_single(
 
     elapsed = time.time() - start
 
+    # 获取场景预期良性工具（TAMAS 标准）
+    expected_tools = get_scenario_benign_tools(scenario)
+
     # 评估
     eval_result = evaluate_output(
         user_query=task_info["clean_query"],
@@ -290,6 +293,7 @@ async def run_tamas_single(
         attack_type=attack_type,
         mode=mode,
         injected_query=task_info["attack_query"] if mode == "attack" else "",
+        expected_tools=expected_tools,
     )
 
     result_dict = {
@@ -307,6 +311,7 @@ async def run_tamas_single(
         "reasoning": eval_result["reasoning"],
         "tools_called": eval_result.get("tools_called", []),
         "malicious_tools_called": eval_result.get("malicious_tools_called", []),
+        "tool_coverage": eval_result.get("tool_coverage", 0.0),
         "elapsed_time": round(elapsed, 1),
     }
 

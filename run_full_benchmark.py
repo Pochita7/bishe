@@ -69,8 +69,10 @@ from tamas_adapter.guardian import Guardian
 
 GAIA_BASELINE_OUTPUT  = "benchmark_gaia_baseline.jsonl"
 GAIA_DEFENDED_OUTPUT  = "benchmark_gaia_defended.jsonl"
+GAIA_SENTINEL_OUTPUT  = "benchmark_gaia_sentinel.jsonl"
 TAMAS_BASELINE_OUTPUT = "benchmark_tamas_baseline.jsonl"
 TAMAS_DEFENDED_OUTPUT = "benchmark_tamas_defended.jsonl"
+TAMAS_SENTINEL_OUTPUT = "benchmark_tamas_sentinel.jsonl"
 
 GAIA_TIMEOUT  = 300   # 秒
 TAMAS_TIMEOUT = 300   # 秒
@@ -118,11 +120,25 @@ def load_results(path: str) -> List[dict]:
     return results
 
 
+def make_sentinel_kwargs(prefix: str, bootstrap_events: int = 24) -> Dict[str, Any]:
+    return {
+        "behavior_db_path": f"{prefix}_sentinel_behavior_db.jsonl",
+        "assessment_log_path": f"{prefix}_sentinel_assessments.jsonl",
+        "bootstrap_events": bootstrap_events,
+    }
+
+
 # ============================================================
 # GAIA 单次测试
 # ============================================================
 
-async def run_gaia_single(task: dict, use_guardian: bool = False, verbose: bool = True) -> dict:
+async def run_gaia_single(
+    task: dict,
+    use_guardian: bool = False,
+    use_sentinel: bool = False,
+    sentinel_kwargs: Optional[Dict[str, Any]] = None,
+    verbose: bool = True,
+) -> dict:
     """用独立 MASTeam 求解单个 GAIA 任务，记录详细指标"""
     task_id = task.get("task_id", "")
     ground_truth = task.get("Final answer", "")
@@ -144,6 +160,8 @@ async def run_gaia_single(task: dict, use_guardian: bool = False, verbose: bool 
             scenario="gaia",
             domain_tools=None,
             guardian=guardian,
+            enable_sentinel=use_sentinel,
+            sentinel_kwargs=sentinel_kwargs,
             client=client,
             max_rounds=3,
             verbose=False,
@@ -151,7 +169,13 @@ async def run_gaia_single(task: dict, use_guardian: bool = False, verbose: bool 
             max_tool_calls_per_worker=10,
         )
     else:
-        team = create_gaia_team(client=client, max_rounds=3, verbose=False)
+        team = create_gaia_team(
+            client=client,
+            enable_sentinel=use_sentinel,
+            sentinel_kwargs=sentinel_kwargs,
+            max_rounds=3,
+            verbose=False,
+        )
 
     start = time.time()
     predicted = "NO_ANSWER"
@@ -203,6 +227,8 @@ async def run_gaia_single(task: dict, use_guardian: bool = False, verbose: bool 
         "is_correct": is_correct,
         "elapsed": round(elapsed, 1),
         "use_guardian": use_guardian,
+        "use_sentinel": use_sentinel,
+        "sentinel_status": result.get("sentinel_status", {}) if 'result' in locals() else {},
         **metrics_dict,
     }
 
@@ -231,6 +257,8 @@ async def run_tamas_single(
     task_info: dict,
     mode: str,
     use_guardian: bool = False,
+    use_sentinel: bool = False,
+    sentinel_kwargs: Optional[Dict[str, Any]] = None,
     verbose: bool = True,
 ) -> dict:
     """用独立 MASTeam 求解单个 TAMAS 任务，记录详细指标"""
@@ -264,6 +292,8 @@ async def run_tamas_single(
         scenario=scenario,
         domain_tools=domain_tools,
         guardian=guardian,
+        enable_sentinel=use_sentinel,
+        sentinel_kwargs=sentinel_kwargs,
         client=client,
         max_rounds=2,
         verbose=False,
@@ -354,6 +384,8 @@ async def run_tamas_single(
         "malicious_tools_called": eval_result.get("malicious_tools_called", []),
         "elapsed_time": round(elapsed, 1),
         "use_guardian": use_guardian,
+        "use_sentinel": use_sentinel,
+        "sentinel_status": result.get("sentinel_status", {}) if 'result' in locals() else {},
         **metrics_dict,
     }
 
@@ -385,16 +417,19 @@ async def run_gaia_benchmark(
     tasks: List[dict],
     output_path: str,
     use_guardian: bool = False,
+    use_sentinel: bool = False,
+    sentinel_kwargs: Optional[Dict[str, Any]] = None,
     verbose: bool = True,
 ):
     """运行 GAIA benchmark (baseline 或 defended)，支持断点续跑"""
-    mode_name = "Defended" if use_guardian else "Baseline"
+    mode_name = "Sentinel" if use_sentinel else ("Defended" if use_guardian else "Baseline")
     completed = load_completed_ids(output_path, key="task_id")
     remaining = [t for t in tasks if t.get("task_id", "") not in completed]
 
     print(f"\n{'#'*70}")
     print(f"  GAIA {mode_name} — {len(tasks)} tasks total, {len(completed)} done, {len(remaining)} remaining")
     print(f"  Guardian: {'ON' if use_guardian else 'OFF'}")
+    print(f"  Sentinel: {'ON' if use_sentinel else 'OFF'}")
     print(f"  Output: {output_path}")
     print(f"{'#'*70}")
 
@@ -407,7 +442,13 @@ async def run_gaia_benchmark(
         idx = tasks.index(task) + 1
         print(f"\n--- [{idx}/{len(tasks)}] {task_id}... ({mode_name}) ---")
 
-        r = await run_gaia_single(task, use_guardian=use_guardian, verbose=verbose)
+        r = await run_gaia_single(
+            task,
+            use_guardian=use_guardian,
+            use_sentinel=use_sentinel,
+            sentinel_kwargs=sentinel_kwargs,
+            verbose=verbose,
+        )
         append_result(output_path, r)
 
     print(f"\n  GAIA {mode_name} 完成 ✓")
@@ -421,10 +462,12 @@ async def run_tamas_benchmark(
     all_data: List[dict],
     output_path: str,
     use_guardian: bool = False,
+    use_sentinel: bool = False,
+    sentinel_kwargs: Optional[Dict[str, Any]] = None,
     verbose: bool = True,
 ):
     """运行 TAMAS benchmark (baseline 或 defended)，支持断点续跑"""
-    mode_name = "Defended" if use_guardian else "Baseline"
+    mode_name = "Sentinel" if use_sentinel else ("Defended" if use_guardian else "Baseline")
 
     # 已完成的: id + mode 组合
     completed = set()
@@ -439,6 +482,7 @@ async def run_tamas_benchmark(
     print(f"  TAMAS {mode_name} — {len(all_data)} tasks × 2 modes = {total_inferences} inferences")
     print(f"  Completed: {done_count}, Remaining: {total_inferences - done_count}")
     print(f"  Guardian: {'ON' if use_guardian else 'OFF'}")
+    print(f"  Sentinel: {'ON' if use_sentinel else 'OFF'}")
     print(f"  Output: {output_path}")
     print(f"{'#'*70}")
 
@@ -458,7 +502,14 @@ async def run_tamas_benchmark(
                     print(f"    [{m.upper():6s}] {task_id} — already done, skipping")
                 continue
 
-            r = await run_tamas_single(task_info, mode=m, use_guardian=use_guardian, verbose=verbose)
+            r = await run_tamas_single(
+                task_info,
+                mode=m,
+                use_guardian=use_guardian,
+                use_sentinel=use_sentinel,
+                sentinel_kwargs=sentinel_kwargs,
+                verbose=verbose,
+            )
             append_result(output_path, r)
 
     print(f"\n  TAMAS {mode_name} 完成 ✓")
@@ -667,6 +718,7 @@ async def main_async(args):
     # ---- GAIA 测试 ----
     if not args.only_tamas:
         tasks = load_gaia_tasks()
+        gaia_sentinel_kwargs = make_sentinel_kwargs("gaia", args.sentinel_bootstrap_events)
         print(f"\n[GAIA] Level 1: {len(tasks)} 题 × 2 轮 (Baseline + Defended)")
 
         # Phase 1: Baseline
@@ -675,9 +727,20 @@ async def main_async(args):
         # Phase 2: Defended
         await run_gaia_benchmark(tasks, GAIA_DEFENDED_OUTPUT, use_guardian=True, verbose=not args.quiet)
 
+        if args.with_sentinel:
+            await run_gaia_benchmark(
+                tasks,
+                GAIA_SENTINEL_OUTPUT,
+                use_guardian=True,
+                use_sentinel=True,
+                sentinel_kwargs=gaia_sentinel_kwargs,
+                verbose=not args.quiet,
+            )
+
     # ---- TAMAS 测试 ----
     if not args.only_gaia:
         all_data = load_all_tamas()
+        tamas_sentinel_kwargs = make_sentinel_kwargs("tamas", args.sentinel_bootstrap_events)
 
         # 每种攻击类型取 N 条
         if args.tamas_per_attack > 0:
@@ -701,6 +764,16 @@ async def main_async(args):
         # Phase 4: Defended
         await run_tamas_benchmark(all_data, TAMAS_DEFENDED_OUTPUT, use_guardian=True, verbose=not args.quiet)
 
+        if args.with_sentinel:
+            await run_tamas_benchmark(
+                all_data,
+                TAMAS_SENTINEL_OUTPUT,
+                use_guardian=True,
+                use_sentinel=True,
+                sentinel_kwargs=tamas_sentinel_kwargs,
+                verbose=not args.quiet,
+            )
+
     # ---- 输出对比报告 ----
     print_full_report()
 
@@ -715,6 +788,9 @@ def main():
     # 控制
     parser.add_argument("--only-gaia", action="store_true", help="只跑 GAIA 测试")
     parser.add_argument("--only-tamas", action="store_true", help="只跑 TAMAS 测试")
+    parser.add_argument("--with-sentinel", action="store_true", help="额外运行 Guardian+Sentinel 对照实验")
+    parser.add_argument("--sentinel-bootstrap-events", type=int, default=24,
+                        help="Sentinel 切换到监控模式前需要吸收的基线事件数")
     parser.add_argument("--quiet", action="store_true", help="安静模式")
     parser.add_argument("--report-only", action="store_true", help="只输出已有结果的对比报告")
 

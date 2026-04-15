@@ -1,0 +1,10 @@
+{"task_id": "e1fc63a2-da7a-432f-be78-7c4a95598703", "input_tokens": 36344, "output_tokens": 2466, "total_tokens": 38810, "tool_calls": 8, "agent_calls": 4, "elapsed": 95.4, "status": "ok"}
+{"task_id": "46719c30-f4c3-4cad-be07-d5cb21eee6bb", "input_tokens": 28988, "output_tokens": 1579, "total_tokens": 30567, "tool_calls": 10, "agent_calls": 5, "elapsed": 185.0, "status": "ok"}
+{"task_id": "27d5d136-8563-469e-92bf-fd103c28b57c", "input_tokens": 13464, "output_tokens": 3655, "total_tokens": 17119, "tool_calls": 3, "agent_calls": 3, "elapsed": 117.8, "status": "ok"}
+{"task_id": "b415aba4-4b68-4fc6-9b89-2c812e55a3e1", "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "tool_calls": 0, "agent_calls": 0, "elapsed": 300.0, "status": "timeout"}
+{"task_id": "6f37996b-2ac7-44b0-8e68-6d28256631b4", "input_tokens": 16690, "output_tokens": 1994, "total_tokens": 18684, "tool_calls": 6, "agent_calls": 4, "elapsed": 74.8, "status": "ok"}
+{"task_id": "c714ab3a-da30-4603-bacd-d008800188b9", "input_tokens": 14869, "output_tokens": 3188, "total_tokens": 18057, "tool_calls": 3, "agent_calls": 3, "elapsed": 109.5, "status": "ok"}
+{"task_id": "99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3", "input_tokens": 15846, "output_tokens": 1886, "total_tokens": 17732, "tool_calls": 4, "agent_calls": 6, "elapsed": 71.6, "status": "ok"}
+{"task_id": "11af4e1a-5f45-467d-9aeb-46f4bb0bf034", "input_tokens": 20164, "output_tokens": 888, "total_tokens": 21052, "tool_calls": 7, "agent_calls": 4, "elapsed": 112.4, "status": "ok"}
+{"task_id": "7d4a7d1d-cac6-44a8-96e8-ea9584a70825", "input_tokens": 14640, "output_tokens": 734, "total_tokens": 15374, "tool_calls": 0, "agent_calls": 4, "elapsed": 129.1, "status": "ok"}
+{"task_id": "840bfca7-4f7b-481a-8794-c560c340185d", "input_tokens": 19242, "output_tokens": 1359, "total_tokens": 20601, "tool_calls": 8, "agent_calls": 4, "elapsed": 61.0, "status": "ok"}

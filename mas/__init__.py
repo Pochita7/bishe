@@ -26,5 +26,16 @@ MAS — Multi-Agent System 多智能体架构
 
 from mas.team import MASTeam
 from mas.metrics import MetricsCollector, MetricsLogger, TaskMetrics
+from mas.sentinel import SentinelAgent, SecurityEventBus, SentinelAction, SentinelAssessment, SecurityControlPlane
 
-__all__ = ["MASTeam", "MetricsCollector", "MetricsLogger", "TaskMetrics"]
+__all__ = [
+    "MASTeam",
+    "MetricsCollector",
+    "MetricsLogger",
+    "TaskMetrics",
+    "SentinelAgent",
+    "SecurityEventBus",
+    "SentinelAction",
+    "SentinelAssessment",
+    "SecurityControlPlane",
+]

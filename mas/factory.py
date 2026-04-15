@@ -20,6 +20,7 @@ from agent_framework.openai import OpenAIChatClient
 
 from mas.team import MASTeam
 from mas.metrics import MetricsLogger
+from mas.sentinel import SecurityEventBus, SentinelAgent, SecurityControlPlane
 from mas.workers import (
     create_web_searcher,
     create_web_browser,
@@ -145,12 +146,39 @@ def _get_code_tools() -> List[FunctionTool]:
     ]
 
 
+def _build_sentinel_stack(
+    enable_sentinel: bool,
+    sentinel_kwargs: Optional[Dict[str, Any]],
+    verbose: bool,
+):
+    security_event_bus = None
+    sentinel = None
+    sentinel_control_plane = None
+    sentinel_kwargs = sentinel_kwargs or {}
+
+    if enable_sentinel:
+        security_event_bus = SecurityEventBus()
+        sentinel = SentinelAgent(**sentinel_kwargs)
+        sentinel_control_plane = SecurityControlPlane()
+        sentinel.bind_event_bus(security_event_bus)
+        sentinel.bind_control_plane(sentinel_control_plane)
+        if verbose:
+            print(
+                f"[MAS] Sentinel enabled: "
+                f"bootstrap={sentinel.bootstrap_events}, mode={sentinel.status['mode']}"
+            )
+
+    return security_event_bus, sentinel, sentinel_control_plane
+
+
 # ============================================================
 # create_gaia_team
 # ============================================================
 
 def create_gaia_team(
     client: Optional[OpenAIChatClient] = None,
+    enable_sentinel: bool = False,
+    sentinel_kwargs: Optional[Dict[str, Any]] = None,
     max_rounds: int = 3,
     verbose: bool = True,
     metrics_logger: Optional[MetricsLogger] = None,
@@ -178,6 +206,12 @@ def create_gaia_team(
     if client is None:
         client = get_text_client()
 
+    security_event_bus, sentinel, sentinel_control_plane = _build_sentinel_stack(
+        enable_sentinel=enable_sentinel,
+        sentinel_kwargs=sentinel_kwargs,
+        verbose=verbose,
+    )
+
     planner = _create_planner_config()
     workers = [
         create_web_searcher(_get_search_tools()),
@@ -196,7 +230,14 @@ def create_gaia_team(
         metrics_logger=metrics_logger,
         worker_timeout=worker_timeout,
         max_tool_calls_per_worker=max_tool_calls_per_worker,
+        security_event_bus=security_event_bus,
+        sentinel_control_plane=sentinel_control_plane,
     )
+
+    if enable_sentinel:
+        setattr(team, "security_event_bus", security_event_bus)
+        setattr(team, "sentinel", sentinel)
+        setattr(team, "sentinel_control_plane", sentinel_control_plane)
 
     if verbose:
         print("[MAS] GAIA Team created:")
@@ -207,6 +248,7 @@ def create_gaia_team(
             print(f"  {w['name']}: {n_tools} tools -> {tool_names}")
         total = sum(len(w.get("tools", [])) for w in workers)
         print(f"  Total: {1 + len(workers)} agents, {total} tools")
+        print(f"  Sentinel: {'enabled' if enable_sentinel else 'disabled'}")
 
     return team
 
@@ -219,6 +261,8 @@ def create_tamas_team(
     scenario: str,
     domain_tools: Optional[List[FunctionTool]] = None,
     guardian=None,
+    enable_sentinel: bool = False,
+    sentinel_kwargs: Optional[Dict[str, Any]] = None,
     client: Optional[OpenAIChatClient] = None,
     max_rounds: int = 2,
     verbose: bool = True,
@@ -246,6 +290,12 @@ def create_tamas_team(
     if client is None:
         client = get_text_client()
 
+    security_event_bus, sentinel, sentinel_control_plane = _build_sentinel_stack(
+        enable_sentinel=enable_sentinel,
+        sentinel_kwargs=sentinel_kwargs,
+        verbose=verbose,
+    )
+
     # GAIA 通用工具
     search_tools = _get_search_tools()
     browse_tools = _get_browse_tools()
@@ -257,35 +307,42 @@ def create_tamas_team(
     if guardian is not None:
         from tamas_adapter.guardian import wrap_tool_with_guardian
 
-        def wrap_list(tool_list):
+        def wrap_list(tool_list, agent_name: str):
             return [
                 FunctionTool(
                     name=t.name,
                     description=t.description,
-                    func=wrap_tool_with_guardian(t.func, t.name, guardian),
+                    func=wrap_tool_with_guardian(t.func, t.name, guardian, source_agent=agent_name),
                 )
                 for t in tool_list
             ]
 
-        search_tools = wrap_list(search_tools)
-        browse_tools = wrap_list(browse_tools)
-        file_tools = wrap_list(file_tools)
-        media_tools = wrap_list(media_tools)
-        code_tools = wrap_list(code_tools)
-        if domain_tools:
-            domain_tools = wrap_list(domain_tools)
+    if guardian is not None and enable_sentinel and security_event_bus is not None:
+        try:
+            guardian.set_event_sink(security_event_bus.publish)
+            guardian.set_runtime_policy_callback(sentinel_control_plane.get_runtime_directive)
+        except AttributeError:
+            # 兼容旧对象：若没有 setter，直接写入内部字段
+            setattr(guardian, "_event_sink", security_event_bus.publish)
+            setattr(guardian, "_runtime_policy_callback", sentinel_control_plane.get_runtime_directive)
+
+    def maybe_wrap_tools(tool_list: List[FunctionTool], agent_name: str) -> List[FunctionTool]:
+        if guardian is None:
+            return tool_list
+        return wrap_list(tool_list, agent_name)
 
     planner = _create_planner_config()
     workers = [
-        create_web_searcher(search_tools),
-        create_web_browser(browse_tools),
-        create_file_reader(file_tools),
-        create_media_analyst(media_tools),
-        create_code_executor(code_tools),
+        create_web_searcher(maybe_wrap_tools(search_tools, "WebSearcher")),
+        create_web_browser(maybe_wrap_tools(browse_tools, "WebBrowser")),
+        create_file_reader(maybe_wrap_tools(file_tools, "FileReader")),
+        create_media_analyst(maybe_wrap_tools(media_tools, "MediaAnalyst")),
+        create_code_executor(maybe_wrap_tools(code_tools, "CodeExecutor")),
     ]
 
     # DomainWorker: TAMAS 领域工具
     if domain_tools:
+        domain_tools = maybe_wrap_tools(domain_tools, "DomainWorker")
         domain_names = ", ".join(t.name for t in domain_tools)
         domain_worker = {
             "name": "DomainWorker",
@@ -321,7 +378,15 @@ def create_tamas_team(
         metrics_logger=metrics_logger,
         worker_timeout=worker_timeout,
         max_tool_calls_per_worker=max_tool_calls_per_worker,
+        security_event_bus=security_event_bus,
+        sentinel_control_plane=sentinel_control_plane,
     )
+
+    if enable_sentinel:
+        setattr(team, "security_event_bus", security_event_bus)
+        setattr(team, "sentinel", sentinel)
+        setattr(team, "sentinel_control_plane", sentinel_control_plane)
+        setattr(team, "guardian", guardian)
 
     if verbose:
         print(f"[MAS] TAMAS Team created ({scenario}):")
@@ -332,5 +397,6 @@ def create_tamas_team(
         total = sum(len(w.get("tools", [])) for w in workers)
         print(f"  Total: {1 + len(workers)} agents, {total} tools")
         print(f"  Guardian: {'enabled' if guardian else 'disabled'}")
+        print(f"  Sentinel: {'enabled' if enable_sentinel else 'disabled'}")
 
     return team

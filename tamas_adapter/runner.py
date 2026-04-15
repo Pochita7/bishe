@@ -14,7 +14,7 @@ from collections import defaultdict
 
 from tamas_adapter.loader import (
     load_all_tamas, extract_task_info,
-    ATTACK_TYPES, SCENARIOS,
+    ATTACK_TYPES, SCENARIOS, get_scenario_benign_tools,
 )
 from tamas_adapter.prompt_builder import build_clean_prompt, build_attack_prompt
 from tamas_adapter.evaluator import evaluate_output, evaluate_with_llm
@@ -128,6 +128,9 @@ async def run_single_task(
 
     elapsed = time.time() - start_time
 
+    # 获取场景预期良性工具（TAMAS 标准）
+    expected_tools = get_scenario_benign_tools(task_info["scenario"])
+
     # 评估
     if use_llm_eval:
         eval_result = evaluate_with_llm(
@@ -144,6 +147,7 @@ async def run_single_task(
             attack_type=task_info["attack_type"],
             mode=mode,
             injected_query=task_info["attack_query"] if mode == "attack" else "",
+            expected_tools=expected_tools,
         )
 
     result_dict = {
@@ -162,6 +166,7 @@ async def run_single_task(
         "reasoning": eval_result["reasoning"],
         "tools_called": eval_result.get("tools_called", []),
         "malicious_tools_called": eval_result.get("malicious_tools_called", []),
+        "tool_coverage": eval_result.get("tool_coverage", 0.0),
         "elapsed_time": round(elapsed, 1),
     }
 

@@ -1,0 +1,72 @@
+[
+  {
+    "task_id": "e1fc63a2-da7a-432f-be78-7c4a95598703",
+    "n_api_calls": 13,
+    "n_usage_none": 0,
+    "api_input": 27970,
+    "api_output": 2149,
+    "api_cached": 0,
+    "framework_input": 27970,
+    "framework_output": 2149,
+    "ratio_input": 1.0,
+    "ratio_output": 1.0,
+    "answer": "17",
+    "is_correct": null
+  },
+  {
+    "task_id": "27d5d136-8563-469e-92bf-fd103c28b57c",
+    "n_api_calls": 5,
+    "n_usage_none": 0,
+    "api_input": 8166,
+    "api_output": 2166,
+    "api_cached": 0,
+    "framework_input": 8166,
+    "framework_output": 2166,
+    "ratio_input": 1.0,
+    "ratio_output": 1.0,
+    "answer": "(¬A → B) ↔ (A ∨ ¬B)",
+    "is_correct": null
+  },
+  {
+    "task_id": "9318445f-fe6a-4e1b-acbf-c68228c9906a",
+    "n_api_calls": 4,
+    "n_usage_none": 0,
+    "api_input": 4924,
+    "api_output": 512,
+    "api_cached": 0,
+    "framework_input": 4924,
+    "framework_output": 512,
+    "ratio_input": 1.0,
+    "ratio_output": 1.0,
+    "answer": "3/4,1/4,3/4,3/4,2/4,1/2,5/35,7/21,30/5,2/4,1/2,6/8,3/4,4/60,1/15,30/90,1/3,8/18,4/9,9/72,1/8,64/46,32/23,206/340,103/170",
+    "is_correct": null
+  },
+  {
+    "task_id": "d0633230-7067-47a9-9dbf-ee11e0a2cdd6",
+    "n_api_calls": 24,
+    "n_usage_none": 0,
+    "api_input": 59471,
+    "api_output": 3349,
+    "api_cached": 0,
+    "framework_input": 59471,
+    "framework_output": 3349,
+    "ratio_input": 1.0,
+    "ratio_output": 1.0,
+    "answer": "predict_proba",
+    "is_correct": null
+  },
+  {
+    "task_id": "3f57289b-8c60-48be-bd80-01f8099ca449",
+    "n_api_calls": 10,
+    "n_usage_none": 0,
+    "api_input": 14193,
+    "api_output": 820,
+    "api_cached": 0,
+    "framework_input": 14193,
+    "framework_output": 820,
+    "ratio_input": 1.0,
+    "ratio_output": 1.0,
+    "answer": "606",
+    "is_correct": null
+  }
+]

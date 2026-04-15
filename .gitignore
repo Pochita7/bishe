@@ -25,6 +25,8 @@ ffmpeg_bin/
 # ===== Backup =====
 gaia_solver_autogen_backup/
 *.bak_*
+sentinel_*.jsonl
+*_sentinel_*.jsonl
 
 # ===== Documents (thesis/reports - not code) =====
 *.docx

@@ -56,9 +56,10 @@ import re
 import asyncio
 import json  # LLM 复核解析
 import logging
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Dict, Set, Optional, Tuple
+from typing import List, Dict, Set, Optional, Tuple, Callable, Any
 
 from tamas_adapter.tools import MALICIOUS_TOOL_NAMES, BENIGN_TOOL_NAMES
 
@@ -150,10 +151,20 @@ class Guardian:
         strict_mode: 严格模式（阻断所有可疑操作，即使误报也宁可多拦）
     """
 
-    def __init__(self, scenario: str = "", strict_mode: bool = False):
+    def __init__(
+        self,
+        scenario: str = "",
+        strict_mode: bool = False,
+        event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+        runtime_policy_callback: Optional[Callable[[str, str, str, Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    ):
         self.scenario = scenario
         self.strict_mode = strict_mode
         self.log = GuardianLog()
+        # 可选事件下沉通道：用于把结构化安全事件推送给 Sentinel
+        self._event_sink = event_sink
+        # 可选运行时策略回调：用于 Sentinel 控制面进行前置阻断
+        self._runtime_policy_callback = runtime_policy_callback
 
         # ====== 策略配置 ======
 
@@ -546,6 +557,23 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
         - 高风险操作指令
         """
         self.log.total_checks += 1
+        runtime_decision = self._check_runtime_policy(
+            source="User",
+            target="Planner",
+            behavior_type="input_review",
+            params={"query": user_query[:300]},
+            gate="InputGate",
+        )
+        if runtime_decision is not None:
+            self._record_decision(
+                runtime_decision,
+                source="User",
+                target="Planner",
+                behavior_type="input_review",
+                params={"query": user_query[:300]},
+            )
+            return runtime_decision
+
         matched_rules = []
         sanitized = user_query
 
@@ -641,7 +669,13 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
                 original_content=user_query[:200],
             )
 
-        self.log.decisions.append(decision)
+        self._record_decision(
+            decision,
+            source="User",
+            target="Planner",
+            behavior_type="input_review",
+            params={"query": user_query[:300]},
+        )
         return decision
 
     # ============================================================
@@ -656,6 +690,23 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
         - Byzantine 攻击导致的异常计划
         """
         self.log.total_checks += 1
+        runtime_decision = self._check_runtime_policy(
+            source="Planner",
+            target="Executor",
+            behavior_type="plan_review",
+            params={"plan": plan_text[:300]},
+            gate="PlanGate",
+        )
+        if runtime_decision is not None:
+            self._record_decision(
+                runtime_decision,
+                source="Planner",
+                target="Executor",
+                behavior_type="plan_review",
+                params={"plan": plan_text[:300]},
+            )
+            return runtime_decision
+
         matched_rules = []
         sanitized = plan_text
 
@@ -725,14 +776,20 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
                 original_content=plan_text[:200],
             )
 
-        self.log.decisions.append(decision)
+        self._record_decision(
+            decision,
+            source="Planner",
+            target="Executor",
+            behavior_type="plan_review",
+            params={"plan": plan_text[:300]},
+        )
         return decision
 
     # ============================================================
     # Gate 3: 工具调用审查（核心拦截层）
     # ============================================================
 
-    def check_tool_call(self, tool_name: str, args: dict = None) -> GuardianDecision:
+    def check_tool_call(self, tool_name: str, args: dict = None, source_agent: str = "Executor") -> GuardianDecision:
         """
         审查单次工具调用:
         - 黑名单工具 → 直接阻断
@@ -745,6 +802,24 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
         self.log.total_checks += 1
         args = args or {}
 
+        runtime_decision = self._check_runtime_policy(
+            source=source_agent,
+            target=tool_name,
+            behavior_type="tool_call",
+            params=args,
+            gate="ToolGate",
+        )
+        if runtime_decision is not None:
+            self.log.blocked_tools.append(tool_name)
+            self._record_decision(
+                runtime_decision,
+                source=source_agent,
+                target=tool_name,
+                behavior_type="tool_call",
+                params=args,
+            )
+            return runtime_decision
+
         # T1: 黑名单直接阻断
         if tool_name in self._tool_blacklist:
             decision = GuardianDecision(
@@ -754,7 +829,13 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
                 original_content=f"{tool_name}({args})"[:200],
             )
             self.log.blocked_tools.append(tool_name)
-            self.log.decisions.append(decision)
+            self._record_decision(
+                decision,
+                source=source_agent,
+                target=tool_name,
+                behavior_type="tool_call",
+                params=args,
+            )
             return decision
 
         # T1.5: 描述扫描标记为 MALICIOUS 的工具 → 自动阻断
@@ -768,7 +849,13 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
                 original_content=f"{tool_name}({args})"[:200],
             )
             self.log.blocked_tools.append(tool_name)
-            self.log.decisions.append(decision)
+            self._record_decision(
+                decision,
+                source=source_agent,
+                target=tool_name,
+                behavior_type="tool_call",
+                params=args,
+            )
             return decision
 
         # T2: 敏感工具参数审查
@@ -782,7 +869,13 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
                     original_content=f"{tool_name}({args})"[:200],
                 )
                 self.log.blocked_tools.append(tool_name)
-                self.log.decisions.append(decision)
+                self._record_decision(
+                    decision,
+                    source=source_agent,
+                    target=tool_name,
+                    behavior_type="tool_call",
+                    params=args,
+                )
                 return decision
 
         # T3: 放行
@@ -791,7 +884,13 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
             reason=f"工具 '{tool_name}' 允许调用",
             original_content=f"{tool_name}({args})"[:200],
         )
-        self.log.decisions.append(decision)
+        self._record_decision(
+            decision,
+            source=source_agent,
+            target=tool_name,
+            behavior_type="tool_call",
+            params=args,
+        )
         return decision
 
     # ============================================================
@@ -806,6 +905,23 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
         - 是否声称完成了越权操作
         """
         self.log.total_checks += 1
+        runtime_decision = self._check_runtime_policy(
+            source="Executor",
+            target="Verifier",
+            behavior_type="output_review",
+            params={"output": output_text[:300]},
+            gate="OutputGate",
+        )
+        if runtime_decision is not None:
+            self._record_decision(
+                runtime_decision,
+                source="Executor",
+                target="Verifier",
+                behavior_type="output_review",
+                params={"output": output_text[:300]},
+            )
+            return runtime_decision
+
         matched_rules = []
         output_lower = output_text.lower()
 
@@ -859,7 +975,13 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
                 original_content=output_text[:200],
             )
 
-        self.log.decisions.append(decision)
+        self._record_decision(
+            decision,
+            source="Executor",
+            target="Verifier",
+            behavior_type="output_review",
+            params={"output": output_text[:300]},
+        )
         return decision
 
     # ============================================================
@@ -961,12 +1083,86 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
     def get_log(self) -> GuardianLog:
         return self.log
 
+    def set_event_sink(self, event_sink: Optional[Callable[[Dict[str, Any]], None]]) -> None:
+        """Set or replace the structured event sink used for external monitoring."""
+        self._event_sink = event_sink
+
+    def set_runtime_policy_callback(
+        self,
+        runtime_policy_callback: Optional[Callable[[str, str, str, Dict[str, Any]], Optional[Dict[str, Any]]]],
+    ) -> None:
+        """Set or replace a runtime policy callback for pre-execution blocking decisions."""
+        self._runtime_policy_callback = runtime_policy_callback
+
+    def _check_runtime_policy(
+        self,
+        source: str,
+        target: str,
+        behavior_type: str,
+        params: Optional[Dict[str, Any]],
+        gate: str,
+    ) -> Optional[GuardianDecision]:
+        if self._runtime_policy_callback is None:
+            return None
+
+        try:
+            directive = self._runtime_policy_callback(source, target, behavior_type, params or {})
+        except Exception as exc:
+            logger.warning("Guardian runtime policy callback failed: %s", exc)
+            return None
+
+        if not directive:
+            return None
+
+        action = str(directive.get("action", "allow")).lower()
+        if action != "block":
+            return None
+
+        return GuardianDecision(
+            action=Action.BLOCK,
+            gate=gate,
+            reason=str(directive.get("reason", "Blocked by runtime policy")),
+            matched_rules=list(directive.get("matched_rules", ["RUNTIME_POLICY_BLOCK"])),
+            original_content=f"{source}->{target} {behavior_type}"[:200],
+        )
+
+    def _record_decision(
+        self,
+        decision: GuardianDecision,
+        source: str,
+        target: str,
+        behavior_type: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """记录 Guardian 决策，并将结构化事件推送给外部 Sentinel。"""
+        self.log.decisions.append(decision)
+
+        if self._event_sink is None:
+            return
+
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source_agent": source,
+            "target": target,
+            "behavior_type": behavior_type,
+            "params": params or {},
+            "gate": decision.gate,
+            "decision": decision.action.value,
+            "reason": decision.reason,
+            "matched_rules": list(decision.matched_rules),
+            "scenario": self.scenario,
+        }
+        try:
+            self._event_sink(event)
+        except Exception as exc:
+            logger.warning("Guardian event sink failed: %s", exc)
+
 
 # ============================================================
 # 受保护的工具 wrapper（透明拦截层）
 # ============================================================
 
-def wrap_tool_with_guardian(func, tool_name: str, guardian: Guardian):
+def wrap_tool_with_guardian(func, tool_name: str, guardian: Guardian, source_agent: str = "Executor"):
     """
     用 Guardian 包装工具函数。
     在实际调用前经过 ToolGate 审查。
@@ -978,7 +1174,7 @@ def wrap_tool_with_guardian(func, tool_name: str, guardian: Guardian):
     if inspect.iscoroutinefunction(func):
         @functools.wraps(func)
         async def guarded_async(*args, **kwargs):
-            decision = guardian.check_tool_call(tool_name, kwargs)
+            decision = guardian.check_tool_call(tool_name, kwargs, source_agent=source_agent)
             if decision.action == Action.BLOCK:
                 # 返回安全的拒绝消息（让 Executor 以为工具执行失败）
                 return f"[Tool '{tool_name}' is unavailable: access denied by security policy]"
@@ -988,7 +1184,7 @@ def wrap_tool_with_guardian(func, tool_name: str, guardian: Guardian):
     else:
         @functools.wraps(func)
         def guarded_sync(*args, **kwargs):
-            decision = guardian.check_tool_call(tool_name, kwargs)
+            decision = guardian.check_tool_call(tool_name, kwargs, source_agent=source_agent)
             if decision.action == Action.BLOCK:
                 return f"[Tool '{tool_name}' is unavailable: access denied by security policy]"
             return func(*args, **kwargs)
