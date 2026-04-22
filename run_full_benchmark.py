@@ -69,9 +69,11 @@ from tamas_adapter.guardian import Guardian
 
 GAIA_BASELINE_OUTPUT  = "benchmark_gaia_baseline.jsonl"
 GAIA_DEFENDED_OUTPUT  = "benchmark_gaia_defended.jsonl"
+GAIA_SENTINEL_ONLY_OUTPUT = "benchmark_gaia_sentinel_only.jsonl"
 GAIA_SENTINEL_OUTPUT  = "benchmark_gaia_sentinel.jsonl"
 TAMAS_BASELINE_OUTPUT = "benchmark_tamas_baseline.jsonl"
 TAMAS_DEFENDED_OUTPUT = "benchmark_tamas_defended.jsonl"
+TAMAS_SENTINEL_ONLY_OUTPUT = "benchmark_tamas_sentinel_only.jsonl"
 TAMAS_SENTINEL_OUTPUT = "benchmark_tamas_sentinel.jsonl"
 
 GAIA_TIMEOUT  = 300   # 秒
@@ -125,6 +127,8 @@ def make_sentinel_kwargs(
     bootstrap_events: int = 24,
     realtime_window_seconds: int = 120,
     scope_realtime_by_task: bool = True,
+    long_horizon_event_limit: int = 200,
+    long_horizon_min_count: int = 6,
 ) -> Dict[str, Any]:
     return {
         "behavior_db_path": f"{prefix}_sentinel_behavior_db.jsonl",
@@ -134,7 +138,46 @@ def make_sentinel_kwargs(
         # while the persisted vector DB still keeps cross-task baseline memory.
         "scope_realtime_by_task": scope_realtime_by_task,
         "realtime_window_seconds": realtime_window_seconds,
+        "long_horizon_event_limit": long_horizon_event_limit,
+        "long_horizon_min_count": long_horizon_min_count,
     }
+
+
+def metrics_to_result_fields(metrics: Optional[TaskMetrics], *, tamas: bool = False) -> Dict[str, Any]:
+    if metrics is None:
+        return {}
+    tool_key = "tool_calls_detail" if tamas else "tool_calls"
+    return {
+        "input_tokens": metrics.input_tokens,
+        "output_tokens": metrics.output_tokens,
+        "total_tokens": metrics.total_tokens,
+        "external_input_tokens": metrics.external_input_tokens,
+        "external_output_tokens": metrics.external_output_tokens,
+        "external_total_tokens": metrics.external_total_tokens,
+        "external_llm_calls": dict(metrics.external_llm_calls),
+        "external_llm_usage": dict(metrics.external_llm_usage),
+        "total_external_llm_calls": metrics.total_external_llm_calls,
+        "external_calls_without_usage": metrics.external_calls_without_usage,
+        tool_key: dict(metrics.tool_calls),
+        "total_tool_calls": metrics.total_tool_calls,
+        "agent_calls": dict(metrics.agent_calls),
+        "total_agent_calls": metrics.total_agent_calls,
+        "handoff_count": metrics.handoff_count,
+        "rounds": metrics.rounds,
+        "turns": metrics.turns,
+        "planner_time": round(metrics.planner_time, 1),
+        "worker_time": round(metrics.worker_time, 1),
+    }
+
+
+def defense_mode_name(use_guardian: bool, use_sentinel: bool) -> str:
+    if use_guardian and use_sentinel:
+        return "Guardian+Sentinel"
+    if use_sentinel:
+        return "Sentinel-only"
+    if use_guardian:
+        return "Guardian-only"
+    return "Baseline"
 
 
 # ============================================================
@@ -199,24 +242,15 @@ async def run_gaia_single(
 
         # 提取详细指标
         m: TaskMetrics = result.get("metrics")
-        if m:
-            metrics_dict = {
-                "input_tokens": m.input_tokens,
-                "output_tokens": m.output_tokens,
-                "total_tokens": m.total_tokens,
-                "tool_calls": dict(m.tool_calls),
-                "total_tool_calls": m.total_tool_calls,
-                "agent_calls": dict(m.agent_calls),
-                "total_agent_calls": m.total_agent_calls,
-                "handoff_count": m.handoff_count,
-                "rounds": m.rounds,
-                "turns": m.turns,
-                "planner_time": round(m.planner_time, 1),
-                "worker_time": round(m.worker_time, 1),
-            }
+        metrics_dict = metrics_to_result_fields(m, tamas=False)
 
     except asyncio.TimeoutError:
         predicted = "TIMEOUT"
+        if 'team' in locals() and hasattr(team, "get_partial_metrics"):
+            metrics_dict = metrics_to_result_fields(
+                team.get_partial_metrics(answer=predicted, expected_answer=ground_truth),
+                tamas=False,
+            )
         if verbose:
             print(f"  [TIMEOUT after {GAIA_TIMEOUT}s]")
     except Exception as e:
@@ -237,6 +271,7 @@ async def run_gaia_single(
         "elapsed": round(elapsed, 1),
         "use_guardian": use_guardian,
         "use_sentinel": use_sentinel,
+        "defense_mode": defense_mode_name(use_guardian, use_sentinel),
         "sentinel_status": result.get("sentinel_status", {}) if 'result' in locals() else {},
         **metrics_dict,
     }
@@ -344,25 +379,16 @@ async def run_tamas_single(
 
         # 详细指标
         tm: TaskMetrics = result.get("metrics")
-        if tm:
-            metrics_dict = {
-                "input_tokens": tm.input_tokens,
-                "output_tokens": tm.output_tokens,
-                "total_tokens": tm.total_tokens,
-                "tool_calls_detail": dict(tm.tool_calls),
-                "total_tool_calls": tm.total_tool_calls,
-                "agent_calls": dict(tm.agent_calls),
-                "total_agent_calls": tm.total_agent_calls,
-                "handoff_count": tm.handoff_count,
-                "rounds": tm.rounds,
-                "turns": tm.turns,
-                "planner_time": round(tm.planner_time, 1),
-                "worker_time": round(tm.worker_time, 1),
-            }
+        metrics_dict = metrics_to_result_fields(tm, tamas=True)
 
     except asyncio.TimeoutError:
         predicted = "TIMEOUT"
         full_output = f"Task timed out after {TAMAS_TIMEOUT}s"
+        if 'team' in locals() and hasattr(team, "get_partial_metrics"):
+            metrics_dict = metrics_to_result_fields(
+                team.get_partial_metrics(answer=predicted),
+                tamas=True,
+            )
     except Exception as e:
         predicted = f"ERROR: {str(e)[:200]}"
         full_output = str(e)
@@ -395,6 +421,7 @@ async def run_tamas_single(
         "elapsed_time": round(elapsed, 1),
         "use_guardian": use_guardian,
         "use_sentinel": use_sentinel,
+        "defense_mode": defense_mode_name(use_guardian, use_sentinel),
         "sentinel_status": result.get("sentinel_status", {}) if 'result' in locals() else {},
         **metrics_dict,
     }
@@ -432,7 +459,7 @@ async def run_gaia_benchmark(
     verbose: bool = True,
 ):
     """运行 GAIA benchmark (baseline 或 defended)，支持断点续跑"""
-    mode_name = "Sentinel" if use_sentinel else ("Defended" if use_guardian else "Baseline")
+    mode_name = defense_mode_name(use_guardian, use_sentinel)
     completed = load_completed_ids(output_path, key="task_id")
     remaining = [t for t in tasks if t.get("task_id", "") not in completed]
 
@@ -477,7 +504,7 @@ async def run_tamas_benchmark(
     verbose: bool = True,
 ):
     """运行 TAMAS benchmark (baseline 或 defended)，支持断点续跑"""
-    mode_name = "Sentinel" if use_sentinel else ("Defended" if use_guardian else "Baseline")
+    mode_name = defense_mode_name(use_guardian, use_sentinel)
 
     # 已完成的: id + mode 组合
     completed = set()
@@ -536,7 +563,12 @@ def print_gaia_report():
     print(f"{'='*70}")
 
     datasets = []
-    for label, path in [("Baseline", GAIA_BASELINE_OUTPUT), ("Defended", GAIA_DEFENDED_OUTPUT)]:
+    for label, path in [
+        ("Baseline", GAIA_BASELINE_OUTPUT),
+        ("Guardian-only", GAIA_DEFENDED_OUTPUT),
+        ("Sentinel-only", GAIA_SENTINEL_ONLY_OUTPUT),
+        ("Guardian+Sentinel", GAIA_SENTINEL_OUTPUT),
+    ]:
         results = load_results(path)
         if not results:
             print(f"\n  [{label}] 无数据 ({path})")
@@ -589,7 +621,12 @@ def print_tamas_report():
     print(f"{'='*70}")
 
     datasets = []
-    for label, path in [("Baseline", TAMAS_BASELINE_OUTPUT), ("Defended", TAMAS_DEFENDED_OUTPUT)]:
+    for label, path in [
+        ("Baseline", TAMAS_BASELINE_OUTPUT),
+        ("Guardian-only", TAMAS_DEFENDED_OUTPUT),
+        ("Sentinel-only", TAMAS_SENTINEL_ONLY_OUTPUT),
+        ("Guardian+Sentinel", TAMAS_SENTINEL_OUTPUT),
+    ]:
         results = load_results(path)
         if not results:
             print(f"\n  [{label}] 无数据 ({path})")
@@ -733,14 +770,35 @@ async def main_async(args):
             args.sentinel_bootstrap_events,
             args.sentinel_window_seconds,
             not args.sentinel_global_realtime,
+            args.sentinel_long_event_window,
+            args.sentinel_long_min_count,
         )
-        print(f"\n[GAIA] Level 1: {len(tasks)} 题 × 2 轮 (Baseline + Defended)")
+        gaia_sentinel_only_kwargs = make_sentinel_kwargs(
+            "gaia_sentinel_only",
+            args.sentinel_bootstrap_events,
+            args.sentinel_window_seconds,
+            not args.sentinel_global_realtime,
+            args.sentinel_long_event_window,
+            args.sentinel_long_min_count,
+        )
+        gaia_mode_count = 2 + int(args.sentinel_only) + int(args.with_sentinel)
+        print(f"\n[GAIA] Level 1: {len(tasks)} tasks x {gaia_mode_count} defenses")
 
         # Phase 1: Baseline
         await run_gaia_benchmark(tasks, GAIA_BASELINE_OUTPUT, use_guardian=False, verbose=not args.quiet)
 
         # Phase 2: Defended
         await run_gaia_benchmark(tasks, GAIA_DEFENDED_OUTPUT, use_guardian=True, verbose=not args.quiet)
+
+        if args.sentinel_only:
+            await run_gaia_benchmark(
+                tasks,
+                GAIA_SENTINEL_ONLY_OUTPUT,
+                use_guardian=False,
+                use_sentinel=True,
+                sentinel_kwargs=gaia_sentinel_only_kwargs,
+                verbose=not args.quiet,
+            )
 
         if args.with_sentinel:
             await run_gaia_benchmark(
@@ -760,6 +818,16 @@ async def main_async(args):
             args.sentinel_bootstrap_events,
             args.sentinel_window_seconds,
             not args.sentinel_global_realtime,
+            args.sentinel_long_event_window,
+            args.sentinel_long_min_count,
+        )
+        tamas_sentinel_only_kwargs = make_sentinel_kwargs(
+            "tamas_sentinel_only",
+            args.sentinel_bootstrap_events,
+            args.sentinel_window_seconds,
+            not args.sentinel_global_realtime,
+            args.sentinel_long_event_window,
+            args.sentinel_long_min_count,
         )
 
         # 每种攻击类型取 N 条
@@ -776,13 +844,24 @@ async def main_async(args):
         else:
             print(f"\n[TAMAS] 全量 {len(all_data)} 条")
 
-        print(f"[TAMAS] {len(all_data)} 条 × 2 modes × 2 轮 = {len(all_data)*4} 次推理")
+        tamas_mode_count = 2 + int(args.sentinel_only) + int(args.with_sentinel)
+        print(f"[TAMAS] {len(all_data)} tasks x 2 modes x {tamas_mode_count} defenses = {len(all_data) * 2 * tamas_mode_count} inferences")
 
         # Phase 3: Baseline
         await run_tamas_benchmark(all_data, TAMAS_BASELINE_OUTPUT, use_guardian=False, verbose=not args.quiet)
 
         # Phase 4: Defended
         await run_tamas_benchmark(all_data, TAMAS_DEFENDED_OUTPUT, use_guardian=True, verbose=not args.quiet)
+
+        if args.sentinel_only:
+            await run_tamas_benchmark(
+                all_data,
+                TAMAS_SENTINEL_ONLY_OUTPUT,
+                use_guardian=False,
+                use_sentinel=True,
+                sentinel_kwargs=tamas_sentinel_only_kwargs,
+                verbose=not args.quiet,
+            )
 
         if args.with_sentinel:
             await run_tamas_benchmark(
@@ -809,10 +888,15 @@ def main():
     parser.add_argument("--only-gaia", action="store_true", help="只跑 GAIA 测试")
     parser.add_argument("--only-tamas", action="store_true", help="只跑 TAMAS 测试")
     parser.add_argument("--with-sentinel", action="store_true", help="额外运行 Guardian+Sentinel 对照实验")
+    parser.add_argument("--sentinel-only", action="store_true", help="Run an additional Sentinel-only contrast experiment")
     parser.add_argument("--sentinel-bootstrap-events", type=int, default=24,
                         help="Sentinel 切换到监控模式前需要吸收的基线事件数")
     parser.add_argument("--sentinel-window-seconds", type=int, default=120,
                         help="Sentinel realtime window per task/session (default: 120)")
+    parser.add_argument("--sentinel-long-event-window", type=int, default=200,
+                        help="Sentinel long-horizon event window per scope (default: 200)")
+    parser.add_argument("--sentinel-long-min-count", type=int, default=6,
+                        help="Minimum repeated events for long-horizon Sentinel scoring")
     parser.add_argument("--sentinel-global-realtime", action="store_true",
                         help="Use global Sentinel realtime windows instead of task-scoped isolation")
     parser.add_argument("--quiet", action="store_true", help="安静模式")

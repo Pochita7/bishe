@@ -13,6 +13,7 @@ warnings.filterwarnings('ignore', message='.*duckduckgo_search.*')
 warnings.filterwarnings('ignore', message='.*GuessedAtParserWarning.*')
 
 from gaia_solver.config import GAIA_ATTACHMENTS_DIR, WORK_DIR, API_KEY, BASE_URL, get_openai_client, VISION_MODEL
+from token_accounting import token_usage_scope
 
 
 # ============================================================
@@ -469,20 +470,20 @@ def browse_webpage(url: str, question: str = "") -> str:
                 with open(screenshot_path, 'rb') as f:
                     img_b64 = b64mod.b64encode(f.read()).decode('utf-8')
 
-                from openai import OpenAI
-                client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-                resp = client.chat.completions.create(
-                    model=VISION_MODEL,
-                    messages=[{
-                        'role': 'user',
-                        'content': [
-                            {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{img_b64}'}},
-                            {'type': 'text', 'text': f'Look at this webpage screenshot. {question}'}
-                        ]
-                    }],
-                    max_tokens=1000,
-                    timeout=60
-                )
+                with token_usage_scope("browse_webpage.vision"):
+                    client = get_openai_client()
+                    resp = client.chat.completions.create(
+                        model=VISION_MODEL,
+                        messages=[{
+                            'role': 'user',
+                            'content': [
+                                {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{img_b64}'}},
+                                {'type': 'text', 'text': f'Look at this webpage screenshot. {question}'}
+                            ]
+                        }],
+                        max_tokens=1000,
+                        timeout=60
+                    )
                 vision_answer = resp.choices[0].message.content
                 result += f"\n\n[Vision analysis]: {vision_answer}"
             except Exception as e:
@@ -770,20 +771,20 @@ def analyze_youtube_video(url: str, question: str) -> str:
             with open(video_path, 'rb') as f:
                 video_b64 = b64mod.b64encode(f.read()).decode('utf-8')
 
-            from openai import OpenAI
-            client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-            resp = client.chat.completions.create(
-                model=VISION_MODEL,
-                messages=[{
-                    'role': 'user',
-                    'content': [
-                        {'type': 'video_url', 'video_url': {'url': f'data:video/mp4;base64,{video_b64}'}},
-                        {'type': 'text', 'text': f'{question}\nBe precise and specific. Give exact details.'}
-                    ]
-                }],
-                max_tokens=1000,
-                timeout=120
-            )
+            with token_usage_scope("analyze_youtube_video.vision"):
+                client = get_openai_client()
+                resp = client.chat.completions.create(
+                    model=VISION_MODEL,
+                    messages=[{
+                        'role': 'user',
+                        'content': [
+                            {'type': 'video_url', 'video_url': {'url': f'data:video/mp4;base64,{video_b64}'}},
+                            {'type': 'text', 'text': f'{question}\nBe precise and specific. Give exact details.'}
+                        ]
+                    }],
+                    max_tokens=1000,
+                    timeout=120
+                )
             answer = resp.choices[0].message.content
             if answer and len(answer.strip()) > 2:
                 return f"[Doubao video analysis for {video_id}]\n{answer}"
@@ -833,8 +834,6 @@ def analyze_image(file_name: str, question: str) -> str:
     Returns:
         视觉模型对图片的分析结果
     """
-    from openai import OpenAI
-
     file_path = os.path.join(GAIA_ATTACHMENTS_DIR, file_name)
     if not os.path.exists(file_path):
         return f"Error: Image '{file_name}' not found."
@@ -857,27 +856,28 @@ def analyze_image(file_name: str, question: str) -> str:
             "If this is a chart/table, extract all data values precisely."
         )
 
-        client = get_openai_client()
-        response = client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": enhanced_question},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{img_data}",
-                                "detail": "high",
+        with token_usage_scope("analyze_image.vision"):
+            client = get_openai_client()
+            response = client.chat.completions.create(
+                model=VISION_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": enhanced_question},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{img_data}",
+                                    "detail": "high",
+                                },
                             },
-                        },
-                    ],
-                }
-            ],
-            max_tokens=4000,
-            temperature=0,
-        )
+                        ],
+                    }
+                ],
+                max_tokens=4000,
+                temperature=0,
+            )
         return response.choices[0].message.content
     except Exception as e:
         return f"Error analyzing image: {str(e)}"
@@ -935,12 +935,13 @@ def transcribe_audio(file_name: str) -> str:
 
     # 方案 1：尝试使用 OpenAI 兼容 API
     try:
-        client = get_openai_client()
-        with open(file_path, "rb") as f:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-            )
+        with token_usage_scope("transcribe_audio.whisper"):
+            client = get_openai_client()
+            with open(file_path, "rb") as f:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                )
         if transcript.text and transcript.text.strip():
             return transcript.text
     except Exception:

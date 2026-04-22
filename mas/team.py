@@ -29,6 +29,7 @@ from agent_framework.openai import OpenAIChatClient
 
 from .metrics import MetricsCollector, MetricsLogger, TaskMetrics
 from .sentinel import SecurityControlPlane, SecurityEventBus
+from token_accounting import push_tracker, reset_tracker, snapshot_tracker
 
 
 class _PartialResponse:
@@ -79,6 +80,10 @@ class MASTeam:
         self.security_event_bus = security_event_bus
         self.sentinel_control_plane = sentinel_control_plane
         self._current_task_id = ""
+        self._active_collector: Optional[MetricsCollector] = None
+        self._active_external_usage_tracker: Optional[Dict[str, Any]] = None
+        self._active_expected_answer = ""
+        self._active_planner_rounds = 0
 
         # ---- 构建 Agent 信息摘要 ----
         self._agent_info = self._build_agent_info(workers)
@@ -103,6 +108,7 @@ class MASTeam:
             instructions=selector_prompt,
             default_options={"temperature": 0},
         )
+        self._agents["_Selector"] = self._selector_agent
 
     @staticmethod
     def _trim_text(text: Any, limit: int = 300) -> str:
@@ -315,14 +321,23 @@ class MASTeam:
     # LLM Selector (备选)
     # --------------------------------------------------------
 
-    async def _select_worker_llm(self, step_desc: str) -> Optional[str]:
+    async def _select_worker_llm(
+        self,
+        step_desc: str,
+        collector: Optional[MetricsCollector] = None,
+    ) -> Optional[str]:
         """PLAN 解析失败时，使用 LLM 选择 Worker"""
         prompt = f"Task: {step_desc}\nWhich worker should handle this?"
         try:
-            result = await asyncio.wait_for(
-                self._selector_agent.run(prompt), timeout=30
-            )
-            text = result.text if hasattr(result, "text") else str(result)
+            t0 = time.time()
+            text, result = await self._invoke_agent("_Selector", prompt, timeout=30)
+            if collector is not None:
+                collector.record_agent_call(
+                    "_Selector",
+                    result,
+                    time.time() - t0,
+                    is_planner=True,
+                )
             for name in self._worker_names:
                 if name.lower() in text.lower():
                     return name
@@ -348,6 +363,7 @@ class MASTeam:
         from agent_framework._tools import _token_usage_tracker
         usage_tracker: dict = {'usage': None}
         token = _token_usage_tracker.set(usage_tracker)
+        invoke_start = time.time()
 
         try:
             result = await asyncio.wait_for(agent.run(prompt), timeout=timeout)
@@ -376,12 +392,39 @@ class MASTeam:
             # 构造一个 pseudo-response 以便 record_agent_call 能记录 partial token
             pseudo_resp = _PartialResponse(usage_details=partial_usage)
             return "[Timeout]", pseudo_resp
+        except asyncio.CancelledError:
+            partial_usage = usage_tracker.get('usage')
+            if partial_usage and self._active_collector is not None:
+                self._active_collector.record_agent_call(
+                    agent_name,
+                    _PartialResponse(usage_details=partial_usage),
+                    time.time() - invoke_start,
+                    is_planner=(agent_name == self._planner_name or agent_name == "_Selector"),
+                )
+            raise
         except Exception as e:
             partial_usage = usage_tracker.get('usage')
             pseudo_resp = _PartialResponse(usage_details=partial_usage) if partial_usage else None
             return f"[Error: {e}]", pseudo_resp
         finally:
             _token_usage_tracker.reset(token)
+
+    def get_partial_metrics(
+        self,
+        answer: str = "",
+        expected_answer: Optional[str] = None,
+    ) -> Optional[TaskMetrics]:
+        """Return metrics collected so far when an outer benchmark timeout cancels run()."""
+        if self._active_collector is None:
+            return None
+        self._active_collector.sync_external_usage(
+            snapshot_tracker(self._active_external_usage_tracker)
+        )
+        return self._active_collector.finalize(
+            answer=answer,
+            expected_answer=self._active_expected_answer if expected_answer is None else expected_answer,
+            rounds=self._active_planner_rounds,
+        )
 
     # --------------------------------------------------------
     # 并行分组
@@ -490,10 +533,7 @@ class MASTeam:
             collector.record_agent_call(
                 target_name, worker_resp, time.time() - t0, is_planner=False
             )
-
-            history.append({"source": target_name, "content": worker_text})
-            worker_results.append((target_name, worker_text))
-            self._publish_security_event(
+            result_directive = self._monitor_behavior(
                 source_agent=target_name,
                 target=self._planner_name,
                 behavior_type="worker_result",
@@ -502,8 +542,20 @@ class MASTeam:
                     "handoff_from": worker_name,
                 },
                 gate="ResultMonitor",
-                decision="allow",
             )
+            if result_directive:
+                blocked_text = (
+                    f"[Sentinel blocked result from {target_name}: "
+                    f"{result_directive.get('reason', 'execution suspended')}]"
+                )
+                history.append({"source": "Sentinel", "content": blocked_text})
+                worker_results.append((target_name, blocked_text))
+                if self.verbose:
+                    print(f"    [Sentinel]: {blocked_text}")
+                break
+
+            history.append({"source": target_name, "content": worker_text})
+            worker_results.append((target_name, worker_text))
 
             if self.verbose:
                 preview = worker_text[:200].replace("\n", " ")
@@ -602,33 +654,87 @@ class MASTeam:
         guardian = getattr(self, "guardian", None)
         if guardian is not None and hasattr(guardian, "set_current_task_id"):
             guardian.set_current_task_id(self._current_task_id)
+        sentinel = getattr(self, "sentinel", None)
+        if sentinel is not None and hasattr(sentinel, "set_current_task_id"):
+            sentinel.set_current_task_id(self._current_task_id)
         history: List[Dict[str, str]] = []
         final_answer = ""
         planner_rounds = 0
 
         # ---- 指标收集器 ----
         collector = MetricsCollector(task_id=task_id, task=task)
+        self._active_collector = collector
+        external_usage_token, external_usage_tracker = push_tracker()
+        self._active_external_usage_tracker = external_usage_tracker
+        self._active_expected_answer = expected_answer
+        self._active_planner_rounds = 0
 
         if self.verbose:
             print(f"\n[MASTeam] Starting task...")
             print(f"  Agents: {[a.name for a in self._agent_list]}")
 
+        task_input_decision = "allow"
+        task_input_reason = ""
+        task_input_rules: List[str] = []
+        task_input_params: Dict[str, Any] = {
+            "task_id": task_id,
+            "task_preview": self._trim_text(task, 320),
+        }
+        if sentinel is not None and hasattr(sentinel, "review_task_input"):
+            task_review = sentinel.review_task_input(
+                task,
+                task_id=self._current_task_id,
+                source_agent="User",
+                target=self._planner_name,
+            )
+            if task_review.action == "sanitize":
+                task = task_review.effective_task
+                collector.task = task
+                task_input_decision = "sanitize"
+                task_input_reason = "; ".join(task_review.reasons[:2]) or "sanitized task input"
+                task_input_rules = list(task_review.matched_rules)
+                task_input_params = {
+                    "task_id": task_id,
+                    "task_preview": self._trim_text(task, 320),
+                    "sanitized": True,
+                    "detected_markers": list(task_review.detected_markers),
+                    "sanitization_reason": task_input_reason,
+                }
+                sanitized_text = f"[Sentinel sanitized task input: {task_input_reason}]"
+                history.append({"source": "Sentinel", "content": sanitized_text})
+                if self.verbose:
+                    print(f"  [Sentinel]: {sanitized_text}")
+            elif task_review.action == "hitl":
+                task_input_decision = "block"
+                task_input_reason = "; ".join(task_review.reasons[:2]) or "task input requires human review"
+                task_input_rules = list(task_review.matched_rules)
+                task_input_params = {
+                    "task_id": task_id,
+                    "task_preview": "[withheld_for_hitl]",
+                    "detected_markers": list(task_review.detected_markers),
+                    "sanitization_reason": task_input_reason,
+                }
+                blocked_text = f"[Sentinel paused task input: {task_input_reason}]"
+                history.append({"source": "Sentinel", "content": blocked_text})
+                final_answer = "Execution suspended by Sentinel"
+                if self.verbose:
+                    print(f"  [Sentinel]: {blocked_text}")
+
         self._publish_security_event(
             source_agent="User",
             target=self._planner_name,
             behavior_type="task_input",
-            params={
-                "task_id": task_id,
-                "task_preview": self._trim_text(task, 320),
-            },
+            params=task_input_params,
             gate="TaskIngress",
-            decision="allow",
+            decision=task_input_decision,
+            reason=task_input_reason,
+            matched_rules=task_input_rules,
         )
 
         last_plan_text = ""
         worker_results: List[Tuple[str, str]] = []
 
-        for round_num in range(self.max_rounds):
+        for round_num in range(0 if final_answer else self.max_rounds):
             # ========== 1. Planner 规划/审查 ==========
             if round_num == 0:
                 planner_prompt = self._build_planner_plan_prompt(task)
@@ -666,16 +772,11 @@ class MASTeam:
             collector.record_agent_call(
                 self._planner_name, planner_resp, time.time() - t0, is_planner=True
             )
-            history.append({"source": self._planner_name, "content": planner_text})
             planner_rounds += 1
+            self._active_planner_rounds = planner_rounds
 
-            if self.verbose:
-                preview = planner_text[:300].replace("\n", " ")
-                print(f"\n  [Round {round_num + 1}] [{self._planner_name}]: {preview}")
-
-            # 检查 FINAL_ANSWER（首轮跳过: 强制先走 Worker）
             fa = self._extract_final_answer(planner_text)
-            self._publish_security_event(
+            planner_result_directive = self._monitor_behavior(
                 source_agent=self._planner_name,
                 target="MASTeam",
                 behavior_type="final_answer" if fa and round_num > 0 else "plan_review",
@@ -685,8 +786,25 @@ class MASTeam:
                     "parsed_steps": len(self._parse_plan(planner_text)),
                 },
                 gate="PlannerResult",
-                decision="allow",
             )
+            if planner_result_directive:
+                final_answer = "Execution suspended by Sentinel"
+                blocked_text = (
+                    f"[Sentinel blocked {self._planner_name}: "
+                    f"{planner_result_directive.get('reason', 'execution suspended')}]"
+                )
+                history.append({"source": "Sentinel", "content": blocked_text})
+                if self.verbose:
+                    print(f"\n  [Sentinel]: {blocked_text}")
+                break
+
+            history.append({"source": self._planner_name, "content": planner_text})
+
+            if self.verbose:
+                preview = planner_text[:300].replace("\n", " ")
+                print(f"\n  [Round {round_num + 1}] [{self._planner_name}]: {preview}")
+
+            # 检查 FINAL_ANSWER（首轮跳过: 强制先走 Worker）
             if fa and round_num > 0:
                 final_answer = fa
                 break
@@ -699,7 +817,7 @@ class MASTeam:
             if not steps:
                 if self.verbose:
                     print("  [WARN] Could not parse PLAN steps, trying LLM selector...")
-                worker_name = await self._select_worker_llm(task)
+                worker_name = await self._select_worker_llm(task, collector)
                 if worker_name:
                     steps = [(task[:200], worker_name)]
 
@@ -723,7 +841,7 @@ class MASTeam:
                     if self.verbose:
                         print(f"  [Step] → {worker_name}: {step_desc[:120]}")
 
-                    self._publish_security_event(
+                    assignment_directive = self._monitor_behavior(
                         source_agent=self._planner_name,
                         target=worker_name,
                         behavior_type="worker_assignment",
@@ -733,8 +851,17 @@ class MASTeam:
                             "parallel_group_size": 1,
                         },
                         gate="PlanDispatch",
-                        decision="allow",
                     )
+                    if assignment_directive:
+                        blocked_text = (
+                            f"[Sentinel blocked assignment to {worker_name}: "
+                            f"{assignment_directive.get('reason', 'execution suspended')}]"
+                        )
+                        history.append({"source": "Sentinel", "content": blocked_text})
+                        worker_results.append((worker_name, blocked_text))
+                        if self.verbose:
+                            print(f"    [Sentinel]: {blocked_text}")
+                        continue
                     worker_directive = self._monitor_behavior(
                         source_agent=worker_name,
                         target=self._planner_name,
@@ -762,9 +889,7 @@ class MASTeam:
                     collector.record_agent_call(
                         worker_name, worker_resp, time.time() - t0, is_planner=False
                     )
-                    history.append({"source": worker_name, "content": worker_text})
-                    worker_results.append((worker_name, worker_text))
-                    self._publish_security_event(
+                    result_directive = self._monitor_behavior(
                         source_agent=worker_name,
                         target=self._planner_name,
                         behavior_type="worker_result",
@@ -773,8 +898,20 @@ class MASTeam:
                             "round": round_num + 1,
                         },
                         gate="ResultMonitor",
-                        decision="allow",
                     )
+                    if result_directive:
+                        blocked_text = (
+                            f"[Sentinel blocked result from {worker_name}: "
+                            f"{result_directive.get('reason', 'execution suspended')}]"
+                        )
+                        history.append({"source": "Sentinel", "content": blocked_text})
+                        worker_results.append((worker_name, blocked_text))
+                        if self.verbose:
+                            print(f"    [Sentinel]: {blocked_text}")
+                        continue
+
+                    history.append({"source": worker_name, "content": worker_text})
+                    worker_results.append((worker_name, worker_text))
 
                     if self.verbose:
                         preview = worker_text[:200].replace("\n", " ")
@@ -792,7 +929,7 @@ class MASTeam:
                         print(f"  [Parallel] → {names}")
 
                     async def _run_step(desc, wname):
-                        self._publish_security_event(
+                        assignment_directive = self._monitor_behavior(
                             source_agent=self._planner_name,
                             target=wname,
                             behavior_type="worker_assignment",
@@ -802,8 +939,13 @@ class MASTeam:
                                 "parallel_group_size": len(group),
                             },
                             gate="PlanDispatch",
-                            decision="allow",
                         )
+                        if assignment_directive:
+                            text = (
+                                f"[Sentinel blocked assignment to {wname}: "
+                                f"{assignment_directive.get('reason', 'execution suspended')}]"
+                            )
+                            return wname, text, None, 0.0
                         directive = self._monitor_behavior(
                             source_agent=wname,
                             target=self._planner_name,
@@ -824,7 +966,9 @@ class MASTeam:
                         t0 = time.time()
                         text, resp = await self._invoke_agent(wname, prompt, timeout=wk_timeout)
                         elapsed_s = time.time() - t0
-                        return wname, text, resp, elapsed_s
+                        if resp is not None:
+                            collector.record_agent_call(wname, resp, elapsed_s, is_planner=False)
+                        return wname, text, None, elapsed_s
 
                     tasks_list = [_run_step(d, w) for d, w in group]
                     results_list = await asyncio.gather(*tasks_list, return_exceptions=True)
@@ -837,9 +981,7 @@ class MASTeam:
                         wname, wtext, wresp, welapsed = item
                         if wresp is not None:
                             collector.record_agent_call(wname, wresp, welapsed, is_planner=False)
-                        history.append({"source": wname, "content": wtext})
-                        worker_results.append((wname, wtext))
-                        self._publish_security_event(
+                        result_directive = self._monitor_behavior(
                             source_agent=wname,
                             target=self._planner_name,
                             behavior_type="worker_result",
@@ -848,8 +990,20 @@ class MASTeam:
                                 "round": round_num + 1,
                             },
                             gate="ResultMonitor",
-                            decision="allow",
                         )
+                        if result_directive:
+                            blocked_text = (
+                                f"[Sentinel blocked result from {wname}: "
+                                f"{result_directive.get('reason', 'execution suspended')}]"
+                            )
+                            history.append({"source": "Sentinel", "content": blocked_text})
+                            worker_results.append((wname, blocked_text))
+                            if self.verbose:
+                                print(f"    [Sentinel]: {blocked_text}")
+                            continue
+
+                        history.append({"source": wname, "content": wtext})
+                        worker_results.append((wname, wtext))
                         if self.verbose:
                             preview = wtext[:200].replace("\n", " ")
                             print(f"    [{wname}]: {preview}")
@@ -889,10 +1043,10 @@ class MASTeam:
             collector.record_agent_call(
                 self._planner_name, review_resp, time.time() - t0, is_planner=True
             )
-            history.append({"source": self._planner_name, "content": planner_review})
             planner_rounds += 1
+            self._active_planner_rounds = planner_rounds
             review_answer = self._extract_final_answer(planner_review)
-            self._publish_security_event(
+            review_result_directive = self._monitor_behavior(
                 source_agent=self._planner_name,
                 target="MASTeam",
                 behavior_type="final_answer" if review_answer else "plan_review",
@@ -902,8 +1056,19 @@ class MASTeam:
                     "phase": "review",
                 },
                 gate="PlannerResult",
-                decision="allow",
             )
+            if review_result_directive:
+                final_answer = "Execution suspended by Sentinel"
+                blocked_text = (
+                    f"[Sentinel blocked {self._planner_name}: "
+                    f"{review_result_directive.get('reason', 'execution suspended')}]"
+                )
+                history.append({"source": "Sentinel", "content": blocked_text})
+                if self.verbose:
+                    print(f"  [Sentinel]: {blocked_text}")
+                break
+
+            history.append({"source": self._planner_name, "content": planner_review})
 
             if self.verbose:
                 preview = planner_review[:300].replace("\n", " ")
@@ -952,10 +1117,10 @@ class MASTeam:
                 collector.record_agent_call(
                     self._planner_name, forced_resp, time.time() - t0, is_planner=True
                 )
-                history.append({"source": self._planner_name, "content": forced})
                 planner_rounds += 1
-                final_answer = self._extract_final_answer(forced)
-                self._publish_security_event(
+                self._active_planner_rounds = planner_rounds
+                forced_answer = self._extract_final_answer(forced)
+                forced_result_directive = self._monitor_behavior(
                     source_agent=self._planner_name,
                     target="User",
                     behavior_type="final_answer",
@@ -964,8 +1129,17 @@ class MASTeam:
                         "phase": "forced_answer",
                     },
                     gate="PlannerResult",
-                    decision="allow",
                 )
+                if forced_result_directive:
+                    forced = (
+                        f"[Sentinel blocked {self._planner_name}: "
+                        f"{forced_result_directive.get('reason', 'execution suspended')}]"
+                    )
+                    history.append({"source": "Sentinel", "content": forced})
+                    final_answer = "Execution suspended by Sentinel"
+                else:
+                    history.append({"source": self._planner_name, "content": forced})
+                    final_answer = forced_answer
 
             if self.verbose:
                 preview = forced[:300].replace("\n", " ")
@@ -974,11 +1148,15 @@ class MASTeam:
         elapsed = time.time() - start
 
         # ---- 生成 TaskMetrics ----
+        collector.sync_external_usage(snapshot_tracker(external_usage_tracker))
         metrics = collector.finalize(
             answer=final_answer or "",
             expected_answer=expected_answer,
             rounds=planner_rounds,
         )
+        reset_tracker(external_usage_token)
+        self._active_external_usage_tracker = None
+        self._active_collector = None
 
         # ---- 自动持久化 ----
         if self.metrics_logger:

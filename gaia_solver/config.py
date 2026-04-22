@@ -3,6 +3,9 @@
 适配 Microsoft Agent Framework (agent-framework) Python SDK
 """
 import os
+from typing import Any
+
+from token_accounting import record_openai_response_usage
 
 # ========================
 # 路径配置
@@ -60,4 +63,73 @@ def get_openai_client():
     """获取原生 OpenAI 兼容客户端（用于 Vision、Whisper 等直接调用）"""
     from openai import OpenAI
 
-    return OpenAI(api_key=API_KEY, base_url=BASE_URL)
+    return _TrackedOpenAIClient(OpenAI(api_key=API_KEY, base_url=BASE_URL))
+
+
+class _TrackedCreateProxy:
+    def __init__(self, inner: Any, operation: str):
+        self._inner = inner
+        self._operation = operation
+
+    def create(self, *args, **kwargs):
+        response = self._inner.create(*args, **kwargs)
+        model = kwargs.get("model") or getattr(response, "model", "") or ""
+        record_openai_response_usage(
+            response,
+            model=str(model),
+            operation=self._operation,
+        )
+        return response
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _TrackedChatNamespace:
+    def __init__(self, inner: Any):
+        self._inner = inner
+        self.completions = _TrackedCreateProxy(inner.completions, "chat.completions.create")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _TrackedAudioNamespace:
+    def __init__(self, inner: Any):
+        self._inner = inner
+        self.transcriptions = _TrackedCreateProxy(inner.transcriptions, "audio.transcriptions.create")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _TrackedResponsesNamespace:
+    def __init__(self, inner: Any):
+        self._inner = inner
+
+    def create(self, *args, **kwargs):
+        response = self._inner.create(*args, **kwargs)
+        model = kwargs.get("model") or getattr(response, "model", "") or ""
+        record_openai_response_usage(
+            response,
+            model=str(model),
+            operation="responses.create",
+        )
+        return response
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _TrackedOpenAIClient:
+    def __init__(self, inner: Any):
+        self._inner = inner
+        if hasattr(inner, "chat"):
+            self.chat = _TrackedChatNamespace(inner.chat)
+        if hasattr(inner, "audio"):
+            self.audio = _TrackedAudioNamespace(inner.audio)
+        if hasattr(inner, "responses"):
+            self.responses = _TrackedResponsesNamespace(inner.responses)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)

@@ -20,7 +20,12 @@ from agent_framework.openai import OpenAIChatClient
 
 from mas.team import MASTeam
 from mas.metrics import MetricsLogger
-from mas.sentinel import SecurityEventBus, SentinelAgent, SecurityControlPlane
+from mas.sentinel import (
+    SecurityControlPlane,
+    SecurityEventBus,
+    SentinelAgent,
+    wrap_tool_with_sentinel,
+)
 from mas.workers import (
     create_web_searcher,
     create_web_browser,
@@ -213,12 +218,33 @@ def create_gaia_team(
     )
 
     planner = _create_planner_config()
+
+    def wrap_list_with_sentinel(tool_list: List[FunctionTool], agent_name: str) -> List[FunctionTool]:
+        if not enable_sentinel or sentinel is None:
+            return tool_list
+        return [
+            FunctionTool(
+                name=t.name,
+                description=t.description,
+                func=wrap_tool_with_sentinel(
+                    t.func,
+                    t.name,
+                    event_bus=security_event_bus,
+                    control_plane=sentinel_control_plane,
+                    sentinel=sentinel,
+                    source_agent=agent_name,
+                    scenario="gaia",
+                ),
+            )
+            for t in tool_list
+        ]
+
     workers = [
-        create_web_searcher(_get_search_tools()),
-        create_web_browser(_get_browse_tools()),
-        create_file_reader(_get_file_tools()),
-        create_media_analyst(_get_media_tools()),
-        create_code_executor(_get_code_tools()),
+        create_web_searcher(wrap_list_with_sentinel(_get_search_tools(), "WebSearcher")),
+        create_web_browser(wrap_list_with_sentinel(_get_browse_tools(), "WebBrowser")),
+        create_file_reader(wrap_list_with_sentinel(_get_file_tools(), "FileReader")),
+        create_media_analyst(wrap_list_with_sentinel(_get_media_tools(), "MediaAnalyst")),
+        create_code_executor(wrap_list_with_sentinel(_get_code_tools(), "CodeExecutor")),
     ]
 
     team = MASTeam(
@@ -327,9 +353,26 @@ def create_tamas_team(
             setattr(guardian, "_runtime_policy_callback", sentinel_control_plane.get_runtime_directive)
 
     def maybe_wrap_tools(tool_list: List[FunctionTool], agent_name: str) -> List[FunctionTool]:
-        if guardian is None:
-            return tool_list
-        return wrap_list(tool_list, agent_name)
+        if guardian is not None:
+            return wrap_list(tool_list, agent_name)
+        if enable_sentinel and sentinel is not None:
+            return [
+                FunctionTool(
+                    name=t.name,
+                    description=t.description,
+                    func=wrap_tool_with_sentinel(
+                        t.func,
+                        t.name,
+                        event_bus=security_event_bus,
+                        control_plane=sentinel_control_plane,
+                        sentinel=sentinel,
+                        source_agent=agent_name,
+                        scenario=scenario,
+                    ),
+                )
+                for t in tool_list
+            ]
+        return tool_list
 
     planner = _create_planner_config()
     workers = [

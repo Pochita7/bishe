@@ -45,6 +45,9 @@ class TaskMetrics:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    external_input_tokens: int = 0
+    external_output_tokens: int = 0
+    external_total_tokens: int = 0
 
     # 耗时 (秒)
     elapsed: float = 0.0
@@ -58,6 +61,10 @@ class TaskMetrics:
     # 工具调用统计
     tool_calls: Dict[str, int] = field(default_factory=dict)
     total_tool_calls: int = 0
+    external_llm_calls: Dict[str, int] = field(default_factory=dict)
+    external_llm_usage: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    total_external_llm_calls: int = 0
+    external_calls_without_usage: int = 0
 
     # HANDOFF 统计
     handoff_count: int = 0
@@ -109,10 +116,16 @@ class MetricsCollector:
         self._input_tokens = 0
         self._output_tokens = 0
         self._total_tokens = 0
+        self._external_input_tokens = 0
+        self._external_output_tokens = 0
+        self._external_total_tokens = 0
         self._planner_time = 0.0
         self._worker_time = 0.0
         self._agent_calls: Dict[str, int] = {}
         self._tool_calls: Dict[str, int] = {}
+        self._external_llm_calls: Dict[str, int] = {}
+        self._external_llm_usage: Dict[str, Dict[str, Any]] = {}
+        self._external_calls_without_usage = 0
         self._handoff_count = 0
         self._handoff_details: List[Dict[str, str]] = []
         self._messages: List[Dict[str, str]] = []
@@ -174,6 +187,39 @@ class MetricsCollector:
             "task": task_desc[:200],
         })
 
+    def sync_external_usage(self, snapshot: Optional[Dict[str, Any]]):
+        """Sync direct-model token usage captured outside agent.run()."""
+        if not snapshot:
+            self._external_input_tokens = 0
+            self._external_output_tokens = 0
+            self._external_total_tokens = 0
+            self._external_llm_calls = {}
+            self._external_llm_usage = {}
+            self._external_calls_without_usage = 0
+            return
+
+        self._external_input_tokens = int(snapshot.get("input_tokens", 0) or 0)
+        self._external_output_tokens = int(snapshot.get("output_tokens", 0) or 0)
+        self._external_total_tokens = int(snapshot.get("total_tokens", 0) or 0)
+        self._external_calls_without_usage = int(snapshot.get("calls_without_usage", 0) or 0)
+
+        sources = snapshot.get("sources", {}) or {}
+        self._external_llm_calls = {
+            str(name): int((detail or {}).get("calls", 0) or 0)
+            for name, detail in sources.items()
+        }
+        self._external_llm_usage = {
+            str(name): {
+                "calls": int((detail or {}).get("calls", 0) or 0),
+                "input_tokens": int((detail or {}).get("input_tokens", 0) or 0),
+                "output_tokens": int((detail or {}).get("output_tokens", 0) or 0),
+                "total_tokens": int((detail or {}).get("total_tokens", 0) or 0),
+                "models": dict((detail or {}).get("models", {}) or {}),
+                "operations": dict((detail or {}).get("operations", {}) or {}),
+            }
+            for name, detail in sources.items()
+        }
+
     def finalize(
         self,
         answer: str = "",
@@ -195,6 +241,10 @@ class MetricsCollector:
         if expected_answer:
             is_correct = _check_answer(answer, expected_answer)
 
+        combined_input_tokens = self._input_tokens + self._external_input_tokens
+        combined_output_tokens = self._output_tokens + self._external_output_tokens
+        combined_total_tokens = self._total_tokens + self._external_total_tokens
+
         return TaskMetrics(
             task_id=self.task_id,
             task=self.task[:500],
@@ -202,9 +252,12 @@ class MetricsCollector:
             answer=answer,
             expected_answer=expected_answer,
             is_correct=is_correct,
-            input_tokens=self._input_tokens,
-            output_tokens=self._output_tokens,
-            total_tokens=self._total_tokens,
+            input_tokens=combined_input_tokens,
+            output_tokens=combined_output_tokens,
+            total_tokens=combined_total_tokens,
+            external_input_tokens=self._external_input_tokens,
+            external_output_tokens=self._external_output_tokens,
+            external_total_tokens=self._external_total_tokens,
             elapsed=round(elapsed, 1),
             planner_time=round(self._planner_time, 1),
             worker_time=round(self._worker_time, 1),
@@ -212,6 +265,10 @@ class MetricsCollector:
             total_agent_calls=sum(self._agent_calls.values()),
             tool_calls=dict(self._tool_calls),
             total_tool_calls=sum(self._tool_calls.values()),
+            external_llm_calls=dict(self._external_llm_calls),
+            external_llm_usage=dict(self._external_llm_usage),
+            total_external_llm_calls=sum(self._external_llm_calls.values()),
+            external_calls_without_usage=self._external_calls_without_usage,
             handoff_count=self._handoff_count,
             handoff_details=list(self._handoff_details),
             rounds=rounds,

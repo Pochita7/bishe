@@ -21,6 +21,7 @@ owl/
 gaia_work_dir/
 gaia_data/_hf_cache/
 ffmpeg_bin/
+dashboard_runs/
 
 # ===== Backup =====
 gaia_solver_autogen_backup/
