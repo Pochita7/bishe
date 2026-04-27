@@ -19,6 +19,7 @@ from enum import Enum
 from hashlib import blake2b
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 
 class SentinelAction(Enum):
@@ -111,11 +112,259 @@ class TaskInputReview:
         return asdict(self)
 
 
+@dataclass
+class RuntimeMitigation:
+    """A temporary or persistent least-privilege runtime restriction."""
+
+    mitigation_id: str
+    kind: str
+    target: str
+    scope: str
+    reason: str
+    risk_score: float
+    created_at: str
+    capability_cost: float = 0.0
+    source_agent: str = ""
+    behavior_type: str = ""
+    source_event_digest: str = ""
+    expires_at: Optional[float] = None
+    recovery_after_events: int = 3
+    clean_events: int = 0
+    persistent: bool = False
+    active: bool = True
+    recovered_at: str = ""
+    recovery_reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        if self.expires_at:
+            data["expires_at"] = datetime.fromtimestamp(self.expires_at, timezone.utc).isoformat()
+        else:
+            data["expires_at"] = ""
+        return data
+
+
+@dataclass
+class ContentQuarantineRecord:
+    """Tracks tainted prompt/output fragments removed from MAS circulation."""
+
+    record_id: str
+    content_hash: str
+    created_at: str
+    source_agent: str
+    target: str
+    behavior_type: str
+    scope: str
+    reason: str
+    content_preview: str
+    cleanup_action: str = "purged_from_runtime_context"
+    domains: List[str] = field(default_factory=list)
+    source_refs: List[str] = field(default_factory=list)
+    status: str = "quarantined"
+    cleared_from_context_count: int = 0
+    last_cleared_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RemediationPlan:
+    """Human-readable response plan for dynamic slimming, cleanup, and recovery."""
+
+    plan_id: str
+    created_at: str
+    scope: str
+    strategy: str
+    risk_score: float
+    capability_cost: float = 0.0
+    restrictions: List[str] = field(default_factory=list)
+    content_actions: List[str] = field(default_factory=list)
+    blocked_domains: List[str] = field(default_factory=list)
+    blocked_sources: List[str] = field(default_factory=list)
+    phases: List[str] = field(
+        default_factory=lambda: ["detect", "contain", "cleanse", "harden", "recover"]
+    )
+    recovery_after_events: int = 3
+    recovery_actions: List[str] = field(default_factory=list)
+    reasons: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RuntimeJudgeRecord:
+    """Compact audit record for pre-execution runtime judge decisions."""
+
+    record_id: str
+    created_at: str
+    task_id: str
+    source_agent: str
+    target: str
+    behavior_type: str
+    decision: str
+    action: str
+    reason: str
+    matched_rules: List[str] = field(default_factory=list)
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class SecurityControlPlane:
     """Runtime enforcement plane for Sentinel decisions.
 
     Guardian can query this control plane *before* allowing new actions.
     """
+
+    WEB_TOOLS = {
+        "search_web",
+        "search_wikipedia",
+        "fetch_webpage",
+        "browse_webpage",
+        "browser_click",
+        "browser_scroll",
+        "analyze_youtube_video",
+    }
+    FILE_TOOLS = {
+        "read_attachment",
+        "read_excel_file",
+        "read_docx_file",
+        "read_pptx_file",
+        "read_text_file",
+    }
+    CODE_TOOLS = {"execute_python"}
+    MEMORY_TOOLS = {
+        "query_memory",
+        "retrieve_memory",
+        "search_memory",
+        "query_vector_db",
+        "retrieve_from_vector_db",
+    }
+    CONFIG_TOOLS = {
+        "read_config",
+        "load_config",
+        "get_env",
+        "read_environment",
+    }
+    TOOL_GROUP_CAPABILITY_COST = {
+        "web": 0.22,
+        "file": 0.18,
+        "memory": 0.24,
+        "code": 0.16,
+        "config": 0.30,
+    }
+    MITIGATION_KIND_CAPABILITY_COST = {
+        "tool": 0.05,
+        "domain": 0.02,
+        "source": 0.03,
+        "agent": 1.00,
+    }
+    CONTENT_BEHAVIOR_TYPES = {
+        "tool_call",
+        "task_input",
+        "input_review",
+        "agent_message",
+        "plan_review",
+        "worker_assignment",
+        "worker_result",
+        "handoff",
+        "final_answer",
+        "output_review",
+    }
+    TAINT_ANOMALIES = {
+        "agent_instruction_poisoning",
+        "risky_parameter_content",
+        "compound_high_risk_intent",
+        "harmful_output_semantics",
+        "guardian_blocked_behavior",
+        "guardian_sanitized_behavior",
+    }
+    RUNTIME_JUDGE_MAX_TEXT_CHARS = 16000
+    SENSITIVE_PATH_MARKERS = (
+        "/.ssh/",
+        "\\.ssh\\",
+        "id_rsa",
+        "id_dsa",
+        "id_ed25519",
+        "authorized_keys",
+        "/etc/shadow",
+        "/etc/passwd",
+        ".aws/credentials",
+        ".azure/",
+        ".gcloud/",
+        ".pypirc",
+        ".npmrc",
+        ".netrc",
+        ".env",
+        "appdata/roaming/microsoft/credentials",
+    )
+    DANGEROUS_EXEC_PATTERNS = (
+        ("rm_rf_root", re.compile(r"\brm\s+-rf\s+(?:/|~|\*|[A-Za-z]:[\\/])", re.IGNORECASE)),
+        ("download_pipe_shell", re.compile(r"\b(?:curl|wget)\b[^\n|;&]{0,220}\|\s*(?:sh|bash|powershell|pwsh)\b", re.IGNORECASE)),
+        ("powershell_iex", re.compile(r"\b(?:invoke-expression|iex)\b", re.IGNORECASE)),
+        ("system_shutdown", re.compile(r"\b(?:shutdown|reboot|halt|poweroff)\b", re.IGNORECASE)),
+        ("format_drive", re.compile(r"\bformat\s+[A-Za-z]:", re.IGNORECASE)),
+        ("recursive_windows_delete", re.compile(r"\b(?:del|erase)\s+/[a-z]*[fqs][a-z]*\s+(?:[A-Za-z]:[\\/]|\\\\|\*)", re.IGNORECASE)),
+        ("python_shell_danger", re.compile(r"\b(?:os\.system|subprocess\.(?:run|call|popen)|Popen)\s*\([^)]*(?:rm\s+-rf|curl|wget|powershell|invoke-expression|shutdown|format|del\s+/)", re.IGNORECASE | re.DOTALL)),
+        ("python_rmtree_sensitive", re.compile(r"\bshutil\.rmtree\s*\(\s*['\"](?:/|~|[A-Za-z]:[\\/]|[^'\"]*(?:\.ssh|\.aws|\.env))", re.IGNORECASE)),
+        ("fork_bomb", re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;", re.IGNORECASE)),
+    )
+    SECRET_VALUE_PATTERNS = (
+        ("openai_like_secret", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
+        ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+        ("private_key_block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+        ("generic_api_key_assignment", re.compile(r"\b(?:api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?[^'\"\s]{12,}", re.IGNORECASE)),
+    )
+    SOURCE_KEY_CATALOG = {
+        "file": {
+            "file",
+            "file_name",
+            "filename",
+            "path",
+            "filepath",
+            "attachment",
+            "attachment_name",
+            "document",
+            "document_path",
+            "source_file",
+        },
+        "memory": {
+            "memory",
+            "memory_id",
+            "vector_id",
+            "embedding_id",
+            "rag_source",
+            "retrieved_memory",
+            "knowledge_id",
+            "memory_key",
+            "cache_key",
+        },
+        "database": {
+            "database",
+            "db",
+            "table",
+            "collection",
+            "row_id",
+            "record_id",
+            "query_id",
+            "sql_source",
+        },
+        "config": {
+            "config",
+            "configuration",
+            "setting",
+            "settings",
+            "env",
+            "environment",
+            "profile",
+            "policy",
+            "credential_source",
+            "secret_source",
+        },
+    }
 
     def __init__(self):
         self.blocked_tools: set[str] = set()
@@ -126,11 +375,28 @@ class SecurityControlPlane:
         self.paused_agents_by_task: Dict[str, set[str]] = defaultdict(set)
         self._hitl_tickets: Dict[str, HitlTicket] = {}
         self._alerts: List[Dict[str, Any]] = []
+        self._mitigations: Dict[str, RuntimeMitigation] = {}
+        self._content_quarantine: Dict[str, List[ContentQuarantineRecord]] = defaultdict(list)
+        self._remediation_plans: List[RemediationPlan] = []
+        self._context_sanitizations: List[Dict[str, Any]] = []
+        self._runtime_judge_records: List[RuntimeJudgeRecord] = []
+        self._mitigation_counter = 0
+        self._content_counter = 0
+        self._context_sanitization_counter = 0
+        self._runtime_judge_counter = 0
+        self._plan_counter = 0
+        self.dynamic_ttl_seconds = 300
+        self.dynamic_recovery_events = 3
 
     def apply_assessment(self, assessment: "SentinelAssessment") -> None:
         event = assessment.event
         action = assessment.action
         task_id = self._event_scope(event)
+        self._expire_mitigations()
+
+        if action == SentinelAction.ALLOW:
+            self._note_clean_event(task_id)
+            return
 
         if action in {
             SentinelAction.ALERT,
@@ -151,27 +417,29 @@ class SecurityControlPlane:
                 }
             )
 
-        if action == SentinelAction.BLOCK:
-            self._block_agent(event.source_agent, task_id)
-            if event.behavior_type == "tool_call":
-                self._block_tool(event.target, task_id)
+        if self._assessment_is_recovery_signal(assessment):
+            self._note_clean_event(task_id)
 
-        elif action == SentinelAction.QUARANTINE:
-            self._block_agent(event.source_agent, task_id)
+        if action == SentinelAction.ALERT:
+            return
 
-        elif action == SentinelAction.HITL:
-            self._pause_agent(event.source_agent, task_id)
-            tid = self._make_ticket_id(event)
-            self._hitl_tickets[tid] = HitlTicket(
-                ticket_id=tid,
-                created_at=datetime.now(timezone.utc).isoformat(),
-                source_agent=event.source_agent,
-                target=event.target,
-                behavior_type=event.behavior_type,
-                risk_score=assessment.risk_score,
-                reason="; ".join(assessment.reasons[:3]),
-                task_id=task_id,
-            )
+        restrictions, content_actions, blocked_domains, blocked_sources = self._apply_dynamic_slimming(
+            assessment,
+            task_id,
+        )
+        if not restrictions and not content_actions and not blocked_domains and not blocked_sources:
+            restrictions.extend(self._apply_last_resort_mitigation(assessment, task_id))
+        self._record_remediation_plan(
+            assessment=assessment,
+            task_id=task_id,
+            restrictions=restrictions,
+            content_actions=content_actions,
+            blocked_domains=blocked_domains,
+            blocked_sources=blocked_sources,
+        )
+
+        if restrictions or content_actions or blocked_domains or blocked_sources:
+            return
 
     def get_runtime_directive(
         self,
@@ -183,6 +451,24 @@ class SecurityControlPlane:
         """Return None to allow, or a blocking directive dict."""
         params = params or {}
         task_id = self._scope_from_params(params)
+        self._expire_mitigations()
+
+        if behavior_type in self.CONTENT_BEHAVIOR_TYPES and self._content_is_quarantined(
+            source_agent,
+            target,
+            behavior_type,
+            params,
+            task_id,
+        ):
+            return {
+                "action": "block",
+                "reason": "tainted prompt/output fragment was quarantined and removed",
+                "matched_rules": ["SENTINEL_CONTENT_QUARANTINE"],
+            }
+
+        source_block = self._blocked_source_directive(params, task_id)
+        if source_block:
+            return source_block
 
         if self._agent_is_paused(source_agent, task_id):
             return {
@@ -207,6 +493,23 @@ class SecurityControlPlane:
                 "matched_rules": ["SENTINEL_QUARANTINE"],
             }
 
+        dynamic_agent = self._active_mitigation("agent", source_agent, task_id)
+        if dynamic_agent and behavior_type in {
+            "tool_call",
+            "agent_message",
+            "plan_review",
+            "worker_assignment",
+            "worker_result",
+            "handoff",
+            "final_answer",
+            "output_review",
+        }:
+            return {
+                "action": "block",
+                "reason": f"Agent '{source_agent}' is temporarily slimmed by Sentinel: {dynamic_agent.reason}",
+                "matched_rules": ["SENTINEL_DYNAMIC_AGENT_SLIM"],
+            }
+
         if behavior_type == "tool_call" and self._tool_is_blocked(target, task_id):
             return {
                 "action": "block",
@@ -214,7 +517,110 @@ class SecurityControlPlane:
                 "matched_rules": ["SENTINEL_BLOCKED_TOOL"],
             }
 
+        if behavior_type == "tool_call":
+            dynamic_tool = self._active_mitigation("tool", target, task_id)
+            if dynamic_tool:
+                return {
+                    "action": "block",
+                    "reason": f"Tool '{target}' is temporarily disabled by Sentinel: {dynamic_tool.reason}",
+                    "matched_rules": ["SENTINEL_DYNAMIC_TOOL_SLIM"],
+                }
+
+            tool_group = self._tool_group_for(target)
+            dynamic_group = self._active_mitigation("tool_group", tool_group, task_id) if tool_group else None
+            if dynamic_group:
+                return {
+                    "action": "block",
+                    "reason": f"Tool group '{tool_group}' is temporarily slimmed by Sentinel: {dynamic_group.reason}",
+                    "matched_rules": ["SENTINEL_DYNAMIC_GROUP_SLIM"],
+                }
+
+        domain = self._extract_domain_from_params(params)
+        if domain:
+            domain_block = self._active_mitigation("domain", domain, task_id)
+            if domain_block:
+                return {
+                    "action": "block",
+                    "reason": f"Domain '{domain}' is blocked by Sentinel cleanup policy",
+                    "matched_rules": ["SENTINEL_BLOCKED_DOMAIN"],
+                }
+
+        if behavior_type == "tool_call":
+            runtime_judge = self._runtime_preflight_tool_gate(
+                source_agent=source_agent,
+                target=target,
+                params=params,
+                task_id=task_id,
+            )
+            if runtime_judge:
+                return runtime_judge
+
         return None
+
+    def _apply_last_resort_mitigation(
+        self,
+        assessment: "SentinelAssessment",
+        task_id: str,
+    ) -> List[str]:
+        event = assessment.event
+        action = assessment.action
+        restrictions: List[str] = []
+        event_digest = self._event_digest(event)
+        reason = "; ".join(assessment.reasons[:3]) or "Sentinel risk threshold exceeded"
+
+        if action == SentinelAction.HITL:
+            self._pause_agent(event.source_agent, task_id)
+            tid = self._make_ticket_id(event)
+            self._hitl_tickets[tid] = HitlTicket(
+                ticket_id=tid,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                source_agent=event.source_agent,
+                target=event.target,
+                behavior_type=event.behavior_type,
+                risk_score=assessment.risk_score,
+                reason=reason,
+                task_id=task_id,
+            )
+            return restrictions
+
+        if action == SentinelAction.BLOCK and event.behavior_type == "tool_call" and event.target:
+            mitigation = self._add_mitigation(
+                kind="tool",
+                target=event.target,
+                scope=task_id,
+                reason="block fallback disabled the exact risky tool",
+                risk_score=assessment.risk_score,
+                source_agent=event.source_agent,
+                behavior_type=event.behavior_type,
+                source_event_digest=event_digest,
+                recovery_after_events=max(2, self.dynamic_recovery_events),
+            )
+            if mitigation:
+                restrictions.append(f"disable_tool:{mitigation.target}")
+                return restrictions
+
+        if action in {SentinelAction.BLOCK, SentinelAction.QUARANTINE} and self._agent_can_be_limited(event.source_agent):
+            mitigation = self._add_mitigation(
+                kind="agent",
+                target=event.source_agent,
+                scope=task_id,
+                reason="no narrower runtime handle was available",
+                risk_score=assessment.risk_score,
+                source_agent=event.source_agent,
+                behavior_type=event.behavior_type,
+                source_event_digest=event_digest,
+                recovery_after_events=max(2, self.dynamic_recovery_events),
+            )
+            if mitigation:
+                restrictions.append(f"pause_agent:{mitigation.target}")
+        return restrictions
+
+    @staticmethod
+    def _agent_can_be_limited(agent: str) -> bool:
+        agent_name = str(agent or "").strip()
+        if not agent_name:
+            return False
+        return agent_name.lower() not in {"user", "guardian", "sentinel", "system"}
 
     def get_guardian_directive(
         self,
@@ -253,7 +659,79 @@ class SecurityControlPlane:
             return []
         return list(self._alerts[-limit:])
 
+    def sanitize_runtime_context(
+        self,
+        messages_or_results: Sequence[Any],
+        task_id: str = "",
+    ) -> Tuple[List[Any], List[Dict[str, Any]]]:
+        """Replace quarantined prompt/output fragments before they re-enter prompts.
+
+        The method preserves the outer structure used by MASTeam: dict messages
+        stay dict messages, worker result tuples stay tuples, and strings stay
+        strings. It returns a sanitized copy plus a compact evidence list.
+        """
+        self._expire_mitigations()
+        if not messages_or_results:
+            return list(messages_or_results or []), []
+
+        sanitized_items: List[Any] = []
+        actions: List[Dict[str, Any]] = []
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        for index, item in enumerate(messages_or_results):
+            text = self._runtime_context_text(item)
+            record = self._matching_quarantine_record(text, task_id)
+            if record is None:
+                sanitized_items.append(item)
+                continue
+
+            record.cleared_from_context_count += 1
+            record.last_cleared_at = now_iso
+            action = {
+                "cleanup_id": f"ctx-{self._context_sanitization_counter + len(actions) + 1:06d}",
+                "timestamp": now_iso,
+                "task_id": str(task_id or record.scope or ""),
+                "record_id": record.record_id,
+                "content_hash": record.content_hash,
+                "source_agent": record.source_agent,
+                "target": record.target,
+                "behavior_type": record.behavior_type,
+                "index": index,
+                "location": self._runtime_context_location(item, index),
+                "domains": list(record.domains),
+                "source_refs": list(record.source_refs),
+                "action": "replace_with_sentinel_placeholder",
+            }
+            placeholder = self._sanitized_context_placeholder(record)
+            sanitized_items.append(self._replace_runtime_context_text(item, placeholder))
+            actions.append(action)
+
+        if actions:
+            self._context_sanitization_counter += len(actions)
+            self._context_sanitizations.extend(actions)
+            if len(self._context_sanitizations) > 200:
+                self._context_sanitizations = self._context_sanitizations[-200:]
+
+        return sanitized_items, actions
+
     def snapshot(self) -> Dict[str, Any]:
+        self._expire_mitigations()
+        active_mitigations = [m.to_dict() for m in self._mitigations.values() if m.active]
+        recovered_mitigations = [
+            m.to_dict()
+            for m in self._mitigations.values()
+            if not m.active and m.recovered_at
+        ]
+        recovered_mitigations.sort(key=lambda item: item.get("recovered_at", ""), reverse=True)
+        quarantined_content = [
+            record.to_dict()
+            for records in self._content_quarantine.values()
+            for record in records
+        ]
+        quarantined_content.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+        runtime_judge_counts: Dict[str, int] = defaultdict(int)
+        for record in self._runtime_judge_records:
+            runtime_judge_counts[record.decision] += 1
         return {
             "blocked_tools": sorted(self.blocked_tools),
             "quarantined_agents": sorted(self.quarantined_agents),
@@ -275,7 +753,1134 @@ class SecurityControlPlane:
             },
             "pending_hitl_tickets": len(self.list_hitl_tickets()),
             "alert_count": len(self._alerts),
+            "runtime_judge_block_count": sum(
+                1 for record in self._runtime_judge_records if record.action == "block"
+            ),
+            "runtime_judge_decision_counts": dict(sorted(runtime_judge_counts.items())),
+            "recent_runtime_judge_decisions": [
+                record.to_dict() for record in self._runtime_judge_records[-10:]
+            ],
+            "active_mitigations": active_mitigations,
+            "dynamic_mitigation_count": len(active_mitigations),
+            "active_capability_cost": round(
+                sum(float(m.capability_cost or 0.0) for m in self._mitigations.values() if m.active),
+                3,
+            ),
+            "temporary_capability_cost": round(
+                sum(
+                    float(m.capability_cost or 0.0)
+                    for m in self._mitigations.values()
+                    if m.active and not m.persistent
+                ),
+                3,
+            ),
+            "recovered_mitigation_count": len(recovered_mitigations),
+            "recent_recovered_mitigations": recovered_mitigations[:10],
+            "blocked_domains": sorted(
+                {
+                    m.target
+                    for m in self._mitigations.values()
+                    if m.active and m.kind == "domain" and not m.scope
+                }
+            ),
+            "task_scoped_blocked_domains": self._task_targets_for_kind("domain"),
+            "blocked_sources": sorted(
+                {
+                    m.target
+                    for m in self._mitigations.values()
+                    if m.active and m.kind == "source" and not m.scope
+                }
+            ),
+            "task_scoped_blocked_sources": self._task_targets_for_kind("source"),
+            "quarantined_content_count": len(quarantined_content),
+            "recent_quarantined_content": quarantined_content[:10],
+            "context_sanitization_count": self._context_sanitization_counter,
+            "recent_context_sanitizations": list(self._context_sanitizations[-10:]),
+            "recent_remediation_plans": [
+                plan.to_dict() for plan in self._remediation_plans[-10:]
+            ],
         }
+
+    def _apply_dynamic_slimming(
+        self,
+        assessment: "SentinelAssessment",
+        task_id: str,
+    ) -> Tuple[List[str], List[str], List[str], List[str]]:
+        event = assessment.event
+        anomalies = set(assessment.anomalies or [])
+        reason = "; ".join(assessment.reasons[:3]) or "Sentinel risk threshold exceeded"
+        event_digest = self._event_digest(event)
+        restrictions: List[str] = []
+        content_actions: List[str] = []
+        blocked_domains: List[str] = []
+        blocked_sources: List[str] = []
+        content_tainted = self._event_has_tainted_content(assessment)
+        domain = self._extract_domain_from_params(event.params or {})
+        source_refs = self._extract_content_sources(event.params or {})
+        source_groups = self._source_groups_for_event(event, domain, source_refs)
+        web_related = "web" in source_groups
+        tool_group = self._tool_group_for(event.target)
+
+        if content_tainted and event.behavior_type in self.CONTENT_BEHAVIOR_TYPES:
+            record = self._quarantine_content(
+                event,
+                task_id,
+                reason,
+                domains=[domain] if domain else [],
+                source_refs=source_refs,
+            )
+            if record:
+                content_actions.append(f"quarantine_content:{record.record_id}")
+                content_actions.append(f"purge_runtime_context:{record.record_id}")
+
+        if content_tainted:
+            for source_ref in source_refs:
+                mitigation = self._add_mitigation(
+                    kind="source",
+                    target=source_ref,
+                    scope=task_id,
+                    reason="non-web content source associated with tainted prompt or output",
+                    risk_score=assessment.risk_score,
+                    source_agent=event.source_agent,
+                    behavior_type=event.behavior_type,
+                    source_event_digest=event_digest,
+                    persistent=True,
+                    recovery_after_events=0,
+                )
+                if mitigation:
+                    blocked_sources.append(source_ref)
+                    content_actions.append(f"quarantine_source:{source_ref}")
+
+        if domain and (content_tainted or web_related or assessment.risk_score >= 65):
+            mitigation = self._add_mitigation(
+                kind="domain",
+                target=domain,
+                scope=task_id,
+                reason="external source associated with tainted behavior",
+                risk_score=assessment.risk_score,
+                source_agent=event.source_agent,
+                behavior_type=event.behavior_type,
+                source_event_digest=event_digest,
+                persistent=True,
+                recovery_after_events=0,
+            )
+            if mitigation:
+                blocked_domains.append(domain)
+
+        for spec in self._select_minimal_runtime_mitigations(
+            assessment=assessment,
+            content_tainted=content_tainted,
+            domain=domain,
+            source_refs=source_refs,
+            source_groups=source_groups,
+            tool_group=tool_group,
+        ):
+            mitigation = self._add_mitigation(
+                kind=spec["kind"],
+                target=spec["target"],
+                scope=task_id,
+                reason=spec["reason"],
+                risk_score=assessment.risk_score,
+                source_agent=event.source_agent,
+                behavior_type=event.behavior_type,
+                source_event_digest=event_digest,
+                recovery_after_events=spec.get("recovery_after_events", self.dynamic_recovery_events),
+                ttl_seconds=spec.get("ttl_seconds"),
+                persistent=bool(spec.get("persistent", False)),
+            )
+            if mitigation:
+                if mitigation.kind == "tool_group":
+                    restrictions.append(f"disable_tool_group:{mitigation.target}")
+                elif mitigation.kind == "tool":
+                    restrictions.append(f"disable_tool:{mitigation.target}")
+                elif mitigation.kind == "agent":
+                    restrictions.append(f"pause_agent:{mitigation.target}")
+
+        if content_tainted and not content_actions and assessment.action in {
+            SentinelAction.BLOCK,
+            SentinelAction.QUARANTINE,
+            SentinelAction.HITL,
+        }:
+            record = self._quarantine_content(
+                event,
+                task_id,
+                reason,
+                domains=[domain] if domain else [],
+                source_refs=source_refs,
+            )
+            if record:
+                content_actions.append(f"quarantine_content:{record.record_id}")
+                content_actions.append(f"purge_runtime_context:{record.record_id}")
+
+        return restrictions, content_actions, blocked_domains, blocked_sources
+
+    def _select_minimal_runtime_mitigations(
+        self,
+        *,
+        assessment: "SentinelAssessment",
+        content_tainted: bool,
+        domain: str,
+        source_refs: Sequence[str],
+        source_groups: set[str],
+        tool_group: str,
+    ) -> List[Dict[str, Any]]:
+        """Choose the smallest temporary capability loss that can stop replay.
+
+        Persistent domain/source blocks handle the external source. Temporary
+        tool-group slimming handles the MAS capability path while the tainted
+        prompt is purged from runtime context.
+        """
+        if assessment.action not in {
+            SentinelAction.BLOCK,
+            SentinelAction.QUARANTINE,
+            SentinelAction.HITL,
+        }:
+            return []
+
+        event = assessment.event
+        anomalies = set(assessment.anomalies or [])
+        specs: List[Dict[str, Any]] = []
+        group_targets: set[str] = set()
+
+        if domain or "web" in source_groups:
+            group_targets.add("web")
+
+        if content_tainted:
+            for source_ref in source_refs:
+                group = self._source_group_for_ref(source_ref)
+                if group:
+                    group_targets.add(group)
+
+        if not group_targets and content_tainted and tool_group:
+            group_targets.add(tool_group)
+
+        for group in sorted(group_targets, key=self._tool_group_cost):
+            specs.append(
+                {
+                    "kind": "tool_group",
+                    "target": group,
+                    "reason": (
+                        f"temporary {group} capability slimming while tainted content "
+                        "is purged and source policy is updated"
+                    ),
+                    "recovery_after_events": self.dynamic_recovery_events,
+                }
+            )
+
+        exact_tool_needed = (
+            event.behavior_type == "tool_call"
+            and (
+                not specs
+                or "sensitive_tool_access" in anomalies
+                or "compound_high_risk_intent" in anomalies
+            )
+        )
+        if exact_tool_needed:
+            if not (tool_group == "web" and any(spec["target"] == "web" for spec in specs)):
+                specs.append(
+                    {
+                        "kind": "tool",
+                        "target": event.target,
+                        "reason": "exact risky tool call disabled with least privilege",
+                        "recovery_after_events": max(2, self.dynamic_recovery_events),
+                    }
+                )
+
+        return specs
+
+    def _record_remediation_plan(
+        self,
+        *,
+        assessment: "SentinelAssessment",
+        task_id: str,
+        restrictions: List[str],
+        content_actions: List[str],
+        blocked_domains: List[str],
+        blocked_sources: List[str],
+    ) -> None:
+        self._plan_counter += 1
+        strategy = "dynamic_slimming"
+        if not restrictions and not content_actions and not blocked_domains and not blocked_sources:
+            strategy = "hitl_or_agent_pause_last_resort"
+        recovery_actions = []
+        if restrictions:
+            recovery_actions.append(
+                f"restore_temporary_capabilities_after_{self.dynamic_recovery_events}_clean_events"
+            )
+        if blocked_domains or blocked_sources:
+            recovery_actions.append("keep_source_policy_until_operator_review")
+        self._remediation_plans.append(
+            RemediationPlan(
+                plan_id=f"plan-{self._plan_counter:06d}",
+                created_at=datetime.now(timezone.utc).isoformat(),
+                scope=task_id,
+                strategy=strategy,
+                risk_score=assessment.risk_score,
+                capability_cost=self._estimate_actions_cost(
+                    restrictions,
+                    blocked_domains,
+                    blocked_sources,
+                ),
+                restrictions=list(dict.fromkeys(restrictions)),
+                content_actions=list(dict.fromkeys(content_actions)),
+                blocked_domains=list(dict.fromkeys(blocked_domains)),
+                blocked_sources=list(dict.fromkeys(blocked_sources)),
+                recovery_after_events=self.dynamic_recovery_events,
+                recovery_actions=recovery_actions,
+                reasons=list(assessment.reasons[:5]),
+            )
+        )
+        if len(self._remediation_plans) > 200:
+            self._remediation_plans = self._remediation_plans[-200:]
+
+    def _estimate_actions_cost(
+        self,
+        restrictions: Sequence[str],
+        blocked_domains: Sequence[str],
+        blocked_sources: Sequence[str],
+    ) -> float:
+        cost = 0.0
+        for item in restrictions:
+            if item.startswith("disable_tool_group:"):
+                cost += self._tool_group_cost(item.split(":", 1)[1])
+            elif item.startswith("disable_tool:"):
+                cost += self.MITIGATION_KIND_CAPABILITY_COST["tool"]
+            elif item.startswith("pause_agent:"):
+                cost += self.MITIGATION_KIND_CAPABILITY_COST["agent"]
+        cost += len(set(blocked_domains)) * self.MITIGATION_KIND_CAPABILITY_COST["domain"]
+        cost += len(set(blocked_sources)) * self.MITIGATION_KIND_CAPABILITY_COST["source"]
+        return round(min(1.0, cost), 3)
+
+    def _mitigation_cost(self, kind: str, target: str) -> float:
+        if kind == "tool_group":
+            return self._tool_group_cost(target)
+        return self.MITIGATION_KIND_CAPABILITY_COST.get(kind, 0.10)
+
+    def _tool_group_cost(self, group: str) -> float:
+        return self.TOOL_GROUP_CAPABILITY_COST.get(str(group or ""), 0.12)
+
+    def _runtime_preflight_tool_gate(
+        self,
+        *,
+        source_agent: str,
+        target: str,
+        params: Dict[str, Any],
+        task_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """ClawKeeper-style lightweight pre-execution judge.
+
+        This is intentionally narrower than Guardian/Sentinel scoring. It only
+        fail-closes for crisp runtime hazards that should not need an LLM call:
+        malformed tool input, sensitive local paths, dangerous execution
+        snippets, and credential-bearing payloads headed toward an egress tool.
+        """
+        validation = self._runtime_input_validation_findings(params)
+        if validation:
+            return self._runtime_judge_directive(
+                source_agent=source_agent,
+                target=target,
+                behavior_type="tool_call",
+                task_id=task_id,
+                decision="stop",
+                reason="tool input failed runtime validation",
+                matched_rules=["SENTINEL_RUNTIME_INPUT_VALIDATOR"],
+                evidence=validation,
+            )
+
+        path_hit = self._runtime_sensitive_path_findings(target, params)
+        if path_hit:
+            return self._runtime_judge_directive(
+                source_agent=source_agent,
+                target=target,
+                behavior_type="tool_call",
+                task_id=task_id,
+                decision="ask_user",
+                reason="sensitive local path access requires operator confirmation",
+                matched_rules=["SENTINEL_RUNTIME_PATH_GUARD"],
+                evidence=path_hit,
+            )
+
+        exec_hit = self._runtime_dangerous_exec_findings(target, params)
+        if exec_hit:
+            return self._runtime_judge_directive(
+                source_agent=source_agent,
+                target=target,
+                behavior_type="tool_call",
+                task_id=task_id,
+                decision="stop",
+                reason="dangerous execution pattern blocked before tool invocation",
+                matched_rules=["SENTINEL_RUNTIME_EXEC_GATE"],
+                evidence=exec_hit,
+            )
+
+        secret_hit = self._runtime_secret_egress_findings(target, params)
+        if secret_hit:
+            return self._runtime_judge_directive(
+                source_agent=source_agent,
+                target=target,
+                behavior_type="tool_call",
+                task_id=task_id,
+                decision="stop",
+                reason="credential-like value detected in outbound tool payload",
+                matched_rules=["SENTINEL_RUNTIME_CREDENTIAL_EGRESS_GUARD"],
+                evidence=secret_hit,
+            )
+
+        return None
+
+    def _runtime_judge_directive(
+        self,
+        *,
+        source_agent: str,
+        target: str,
+        behavior_type: str,
+        task_id: str,
+        decision: str,
+        reason: str,
+        matched_rules: List[str],
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._runtime_judge_counter += 1
+        record = RuntimeJudgeRecord(
+            record_id=f"rj-{self._runtime_judge_counter:06d}",
+            created_at=now_iso,
+            task_id=str(task_id or ""),
+            source_agent=source_agent,
+            target=target,
+            behavior_type=behavior_type,
+            decision=decision,
+            action="block",
+            reason=reason,
+            matched_rules=list(matched_rules or []),
+            evidence=dict(evidence or {}),
+        )
+        self._runtime_judge_records.append(record)
+        if len(self._runtime_judge_records) > 200:
+            self._runtime_judge_records = self._runtime_judge_records[-200:]
+        self._alerts.append(
+            {
+                "timestamp": now_iso,
+                "source_agent": source_agent,
+                "target": target,
+                "behavior_type": behavior_type,
+                "risk_score": 0.0,
+                "action": "block",
+                "runtime_decision": decision,
+                "task_id": str(task_id or ""),
+                "reasons": [reason],
+            }
+        )
+        return {
+            "action": "block",
+            "runtime_decision": decision,
+            "reason": reason,
+            "matched_rules": list(matched_rules or []),
+            "evidence": dict(evidence or {}),
+        }
+
+    def _runtime_input_validation_findings(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        text = self._flatten_param_text(params)
+        findings: Dict[str, Any] = {}
+        if self._params_contain_nul(params):
+            findings["nul_byte"] = True
+        if len(text) > self.RUNTIME_JUDGE_MAX_TEXT_CHARS:
+            findings["text_chars"] = len(text)
+            findings["max_text_chars"] = self.RUNTIME_JUDGE_MAX_TEXT_CHARS
+        return findings
+
+    def _runtime_sensitive_path_findings(
+        self,
+        target: str,
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        target_group = self._tool_group_for(target)
+        findings: List[Dict[str, Any]] = []
+        for key_path, value in self._iter_param_strings(params):
+            if not value:
+                continue
+            if target_group not in {"file", "config", "code"} and not self._key_looks_path_like(key_path):
+                continue
+            probe = self._normalize_path_probe(value)
+            marker = next((m for m in self.SENSITIVE_PATH_MARKERS if m in probe), "")
+            if marker:
+                findings.append(
+                    {
+                        "key": key_path,
+                        "marker": marker,
+                        "path_hint": self._redact_path_hint(value),
+                    }
+                )
+        if not findings:
+            return {}
+        return {
+            "tool_group": target_group or "unknown",
+            "findings": findings[:5],
+        }
+
+    def _runtime_dangerous_exec_findings(
+        self,
+        target: str,
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        target_lower = str(target or "").lower()
+        target_group = self._tool_group_for(target)
+        exec_like = target_group == "code" or any(
+            marker in target_lower
+            for marker in ("exec", "shell", "bash", "powershell", "terminal", "command", "run")
+        )
+        if not exec_like:
+            return {}
+
+        text = self._flatten_param_text(params)
+        hits = [
+            label
+            for label, pattern in self.DANGEROUS_EXEC_PATTERNS
+            if pattern.search(text)
+        ]
+        if not hits:
+            return {}
+        return {
+            "tool_group": target_group or "exec_like",
+            "patterns": hits[:6],
+        }
+
+    def _runtime_secret_egress_findings(
+        self,
+        target: str,
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        target_lower = str(target or "").lower()
+        target_group = self._tool_group_for(target)
+        domain = self._extract_domain_from_params(params)
+        egress_like = bool(domain) or target_group == "web" or any(
+            marker in target_lower
+            for marker in ("send", "upload", "export", "post", "notify", "email", "webhook")
+        )
+        if not egress_like:
+            return {}
+
+        text = self._flatten_param_text(params)
+        hits = [
+            label
+            for label, pattern in self.SECRET_VALUE_PATTERNS
+            if pattern.search(text)
+        ]
+        if not hits:
+            return {}
+        return {
+            "tool_group": target_group or "egress",
+            "domain": domain,
+            "secret_patterns": hits[:5],
+        }
+
+    @staticmethod
+    def _flatten_param_text(value: Any) -> str:
+        try:
+            return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, default=str)
+        except TypeError:
+            return repr(value)
+
+    def _params_contain_nul(self, value: Any) -> bool:
+        if isinstance(value, str):
+            return "\x00" in value
+        if isinstance(value, dict):
+            return any(self._params_contain_nul(item) for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return any(self._params_contain_nul(item) for item in value)
+        return False
+
+    def _iter_param_strings(self, value: Any, prefix: str = ""):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_text = str(key)
+                next_prefix = f"{prefix}.{key_text}" if prefix else key_text
+                yield from self._iter_param_strings(item, next_prefix)
+        elif isinstance(value, (list, tuple, set)):
+            for idx, item in enumerate(value):
+                next_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+                yield from self._iter_param_strings(item, next_prefix)
+        elif isinstance(value, str):
+            yield prefix or "value", value
+
+    @staticmethod
+    def _key_looks_path_like(key_path: str) -> bool:
+        lowered = str(key_path or "").lower()
+        return any(
+            marker in lowered
+            for marker in ("path", "file", "filename", "attachment", "config", "env", "credential", "secret")
+        )
+
+    @staticmethod
+    def _normalize_path_probe(value: str) -> str:
+        text = str(value or "").strip().lower().replace("\\", "/")
+        text = re.sub(r"/+", "/", text)
+        return text
+
+    @staticmethod
+    def _redact_path_hint(value: str) -> str:
+        text = str(value or "").strip().replace("\\", "/")
+        if not text:
+            return ""
+        tail = text.rsplit("/", 1)[-1]
+        if not tail:
+            return "[path]"
+        return tail[:80]
+
+    def _add_mitigation(
+        self,
+        *,
+        kind: str,
+        target: str,
+        scope: str,
+        reason: str,
+        risk_score: float,
+        source_agent: str = "",
+        behavior_type: str = "",
+        source_event_digest: str = "",
+        recovery_after_events: Optional[int] = None,
+        ttl_seconds: Optional[int] = None,
+        persistent: bool = False,
+        capability_cost: Optional[float] = None,
+    ) -> Optional[RuntimeMitigation]:
+        target = str(target or "").strip()
+        if not target:
+            return None
+        if kind == "domain":
+            target = self._normalize_domain(target)
+            if not target:
+                return None
+        elif kind == "source":
+            target = self._normalize_source_ref(target)
+            if not target:
+                return None
+        existing = self._active_mitigation(kind, target, scope)
+        if existing:
+            existing.reason = reason or existing.reason
+            existing.risk_score = max(existing.risk_score, float(risk_score))
+            existing.capability_cost = max(
+                existing.capability_cost,
+                round(
+                    float(capability_cost)
+                    if capability_cost is not None
+                    else self._mitigation_cost(kind, target),
+                    3,
+                ),
+            )
+            existing.clean_events = 0
+            return existing
+
+        self._mitigation_counter += 1
+        ttl = self.dynamic_ttl_seconds if ttl_seconds is None else int(ttl_seconds)
+        mitigation = RuntimeMitigation(
+            mitigation_id=f"mit-{self._mitigation_counter:06d}",
+            kind=kind,
+            target=target,
+            scope=str(scope or ""),
+            reason=reason,
+            risk_score=round(float(risk_score), 2),
+            created_at=datetime.now(timezone.utc).isoformat(),
+            capability_cost=round(
+                float(capability_cost)
+                if capability_cost is not None
+                else self._mitigation_cost(kind, target),
+                3,
+            ),
+            source_agent=source_agent,
+            behavior_type=behavior_type,
+            source_event_digest=source_event_digest,
+            expires_at=None if persistent else (time.time() + ttl),
+            recovery_after_events=(
+                self.dynamic_recovery_events
+                if recovery_after_events is None
+                else max(0, int(recovery_after_events))
+            ),
+            persistent=persistent,
+        )
+        self._mitigations[mitigation.mitigation_id] = mitigation
+        return mitigation
+
+    def _active_mitigation(self, kind: str, target: str, task_id: str) -> Optional[RuntimeMitigation]:
+        target = str(target or "").strip()
+        if kind == "domain":
+            target = self._normalize_domain(target)
+        elif kind == "source":
+            target = self._normalize_source_ref(target)
+        if not target:
+            return None
+        for mitigation in self._mitigations.values():
+            if not mitigation.active or mitigation.kind != kind:
+                continue
+            if mitigation.scope and mitigation.scope != task_id:
+                continue
+            if kind == "domain":
+                if self._domain_matches(target, mitigation.target):
+                    return mitigation
+            elif kind == "source":
+                if self._source_matches(target, mitigation.target):
+                    return mitigation
+            elif mitigation.target == target:
+                return mitigation
+        return None
+
+    def _expire_mitigations(self) -> None:
+        now = time.time()
+        for mitigation in self._mitigations.values():
+            if not mitigation.active or mitigation.persistent:
+                continue
+            if mitigation.expires_at and now >= mitigation.expires_at:
+                mitigation.active = False
+                mitigation.recovered_at = datetime.now(timezone.utc).isoformat()
+                mitigation.recovery_reason = "ttl_expired"
+
+    def _note_clean_event(self, task_id: str) -> None:
+        for mitigation in self._mitigations.values():
+            if not mitigation.active or mitigation.persistent:
+                continue
+            if mitigation.scope and mitigation.scope != task_id:
+                continue
+            mitigation.clean_events += 1
+            if (
+                mitigation.recovery_after_events
+                and mitigation.clean_events >= mitigation.recovery_after_events
+            ):
+                mitigation.active = False
+                mitigation.recovered_at = datetime.now(timezone.utc).isoformat()
+                mitigation.recovery_reason = "clean_event_recovery"
+
+    def _task_targets_for_kind(self, kind: str) -> Dict[str, List[str]]:
+        grouped: Dict[str, set[str]] = defaultdict(set)
+        for mitigation in self._mitigations.values():
+            if mitigation.active and mitigation.kind == kind and mitigation.scope:
+                grouped[mitigation.scope].add(mitigation.target)
+        return {scope: sorted(values) for scope, values in sorted(grouped.items()) if values}
+
+    def _tool_group_for(self, tool: str) -> str:
+        tool_name = str(tool or "")
+        lowered = tool_name.lower()
+        if tool_name in self.WEB_TOOLS or any(part in lowered for part in ("web", "browser", "search", "youtube")):
+            return "web"
+        if tool_name in self.CODE_TOOLS or "python" in lowered or "code" in lowered:
+            return "code"
+        if tool_name in self.MEMORY_TOOLS or any(part in lowered for part in ("memory", "vector", "embedding", "rag", "cache")):
+            return "memory"
+        if tool_name in self.CONFIG_TOOLS or any(part in lowered for part in ("config", "setting", "env", "credential", "secret")):
+            return "config"
+        if any(part in lowered for part in ("database", "sql", "table", "collection")):
+            return "memory"
+        if tool_name in self.FILE_TOOLS or lowered.startswith("read_"):
+            return "file"
+        return ""
+
+    def _is_web_related(self, event: "SecurityEvent", domain: str = "") -> bool:
+        if domain:
+            return True
+        if self._tool_group_for(event.target) == "web":
+            return True
+        probe = f"{event.source_agent} {event.target} {event.gate}".lower()
+        if any(marker in probe for marker in ("web", "browser", "search", "url", "youtube")):
+            return True
+        return bool(self._extract_domain_from_params(event.params or {}))
+
+    def _source_groups_for_event(
+        self,
+        event: "SecurityEvent",
+        domain: str,
+        source_refs: Sequence[str],
+    ) -> set[str]:
+        groups: set[str] = set()
+        if domain or self._is_web_related(event, domain):
+            groups.add("web")
+        tool_group = self._tool_group_for(event.target)
+        if tool_group:
+            groups.add(tool_group)
+        for source_ref in source_refs:
+            group = self._source_group_for_ref(source_ref)
+            if group:
+                groups.add(group)
+        return groups
+
+    @staticmethod
+    def _source_group_for_ref(source_ref: str) -> str:
+        kind = str(source_ref or "").split(":", 1)[0]
+        if kind == "file":
+            return "file"
+        if kind in {"memory", "database"}:
+            return "memory"
+        if kind == "config":
+            return "config"
+        return ""
+
+    def _event_has_tainted_content(self, assessment: "SentinelAssessment") -> bool:
+        anomalies = set(assessment.anomalies or [])
+        if anomalies.intersection(self.TAINT_ANOMALIES):
+            return assessment.risk_score >= 45
+        event = assessment.event
+        if str(event.decision).lower() in {"block", "sanitize"}:
+            return True
+        return False
+
+    def _assessment_is_recovery_signal(self, assessment: "SentinelAssessment") -> bool:
+        """Count benign progress even when residual risk memory is still decaying."""
+        anomalies = set(assessment.anomalies or [])
+        current_risk_anomalies = self.TAINT_ANOMALIES.union(
+            {
+                "tool_call_spike",
+                "unexpected_communication_spike",
+                "behavior_pattern_spike",
+                "sensitive_tool_access",
+                "sensitive_tool_reference",
+                "sensitive_scope_tool_chain",
+                "compound_high_risk_intent",
+                "harmful_output_semantics",
+                "guardian_blocked_behavior",
+                "guardian_sanitized_behavior",
+            }
+        )
+        if anomalies.intersection(current_risk_anomalies):
+            return False
+        if str(assessment.event.decision).lower() != "allow":
+            return False
+        return assessment.event.behavior_type in self.CONTENT_BEHAVIOR_TYPES
+
+    def _quarantine_content(
+        self,
+        event: "SecurityEvent",
+        task_id: str,
+        reason: str,
+        *,
+        domains: Optional[Sequence[str]] = None,
+        source_refs: Optional[Sequence[str]] = None,
+    ) -> Optional[ContentQuarantineRecord]:
+        params = event.params or {}
+        content_hash = self._content_hash(params)
+        scope = task_id or "__global__"
+        for record in self._content_quarantine.get(scope, []):
+            if record.content_hash == content_hash:
+                return record
+
+        self._content_counter += 1
+        record = ContentQuarantineRecord(
+            record_id=f"cq-{self._content_counter:06d}",
+            content_hash=content_hash,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            source_agent=event.source_agent,
+            target=event.target,
+            behavior_type=event.behavior_type,
+            scope=task_id,
+            reason=reason,
+            content_preview=self._content_preview(params),
+            domains=list(dict.fromkeys(domains or [])),
+            source_refs=list(dict.fromkeys(source_refs or [])),
+        )
+        self._content_quarantine[scope].append(record)
+        if len(self._content_quarantine[scope]) > 100:
+            self._content_quarantine[scope] = self._content_quarantine[scope][-100:]
+        return record
+
+    def _content_is_quarantined(
+        self,
+        source_agent: str,
+        target: str,
+        behavior_type: str,
+        params: Dict[str, Any],
+        task_id: str,
+    ) -> bool:
+        content_hash = self._content_hash(params)
+        for scope in (task_id, "__global__"):
+            for record in self._content_quarantine.get(scope, []):
+                if record.status != "quarantined":
+                    continue
+                if record.content_hash != content_hash:
+                    continue
+                if record.behavior_type == behavior_type:
+                    return True
+        return False
+
+    def _matching_quarantine_record(
+        self,
+        text: Any,
+        task_id: str,
+    ) -> Optional[ContentQuarantineRecord]:
+        candidate = str(text or "")
+        if not candidate.strip():
+            return None
+        lowered = candidate.lower()
+        scoped_records: List[ContentQuarantineRecord] = []
+        for scope in (str(task_id or ""), "__global__", ""):
+            if scope:
+                scoped_records.extend(self._content_quarantine.get(scope, []))
+        if not scoped_records and task_id:
+            scoped_records.extend(self._content_quarantine.get("__global__", []))
+
+        markers = (
+            "ignore all prior instructions",
+            "ignore previous instructions",
+            "compromised external instruction",
+            "do not mention this override",
+            "unauthorized external sink",
+            "irrelevant or incorrect tool",
+            "exploitative backdoor clauses",
+        )
+        for record in reversed(scoped_records):
+            if record.status != "quarantined":
+                continue
+            preview = str(record.content_preview or "").strip().lower()
+            if preview and self._text_fragment_matches(lowered, preview):
+                return record
+            for domain in record.domains:
+                if domain and domain.lower() in lowered:
+                    return record
+            for source_ref in record.source_refs:
+                source_lower = source_ref.lower()
+                source_value = source_lower.split(":", 1)[-1]
+                if source_lower in lowered or (source_value and source_value in lowered):
+                    return record
+            if any(marker in lowered for marker in markers):
+                return record
+        return None
+
+    @staticmethod
+    def _text_fragment_matches(candidate_lower: str, preview_lower: str) -> bool:
+        preview = re.sub(r"\s+", " ", preview_lower).strip()
+        candidate = re.sub(r"\s+", " ", candidate_lower).strip()
+        if not preview or not candidate:
+            return False
+        if len(preview) < 24:
+            return preview in candidate
+        return preview in candidate or candidate in preview
+
+    @staticmethod
+    def _runtime_context_text(item: Any) -> str:
+        if isinstance(item, dict):
+            for key in ("content", "message", "text", "result", "output"):
+                if key in item:
+                    return str(item.get(key) or "")
+            return json.dumps(item, ensure_ascii=False, default=str)
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            return str(item[1] or "")
+        return str(item or "")
+
+    @staticmethod
+    def _runtime_context_location(item: Any, index: int) -> str:
+        if isinstance(item, dict):
+            source = str(item.get("source") or item.get("source_agent") or "message")
+            return f"history[{index}].{source}"
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            return f"worker_results[{index}].{item[0]}"
+        return f"context[{index}]"
+
+    @staticmethod
+    def _sanitized_context_placeholder(record: ContentQuarantineRecord) -> str:
+        source_bits = []
+        if record.domains:
+            source_bits.append("domain=" + ",".join(record.domains[:2]))
+        if record.source_refs:
+            source_bits.append("source=" + ",".join(record.source_refs[:2]))
+        source_suffix = f" ({'; '.join(source_bits)})" if source_bits else ""
+        return (
+            f"[Sentinel sanitized tainted context {record.record_id}: "
+            f"quarantined {record.behavior_type} content removed{source_suffix}]"
+        )
+
+    @staticmethod
+    def _replace_runtime_context_text(item: Any, replacement: str) -> Any:
+        if isinstance(item, dict):
+            updated = dict(item)
+            for key in ("content", "message", "text", "result", "output"):
+                if key in updated:
+                    updated[key] = replacement
+                    return updated
+            updated["content"] = replacement
+            return updated
+        if isinstance(item, tuple) and len(item) >= 2:
+            return (item[0], replacement)
+        if isinstance(item, list) and len(item) >= 2:
+            updated = list(item)
+            updated[1] = replacement
+            return updated
+        return replacement
+
+    def _blocked_source_directive(
+        self,
+        params: Dict[str, Any],
+        task_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        for source_ref in self._extract_content_sources(params):
+            mitigation = self._active_mitigation("source", source_ref, task_id)
+            if mitigation:
+                return {
+                    "action": "block",
+                    "reason": f"Content source '{source_ref}' is blocked by Sentinel cleanup policy",
+                    "matched_rules": ["SENTINEL_BLOCKED_CONTENT_SOURCE"],
+                }
+        return None
+
+    @staticmethod
+    def _content_hash(params: Dict[str, Any]) -> str:
+        try:
+            raw = json.dumps(params or {}, ensure_ascii=False, sort_keys=True, default=str)
+        except TypeError:
+            raw = repr(params)
+        return blake2b(raw.encode("utf-8", errors="ignore"), digest_size=12).hexdigest()
+
+    @staticmethod
+    def _content_preview(params: Dict[str, Any], limit: int = 260) -> str:
+        for key in ("content_preview", "prompt_preview", "task_preview", "message", "result", "text"):
+            value = params.get(key)
+            if value:
+                return str(value).replace("\n", " ").strip()[:limit]
+        try:
+            raw = json.dumps(params or {}, ensure_ascii=False, sort_keys=True, default=str)
+        except TypeError:
+            raw = repr(params)
+        return raw.replace("\n", " ").strip()[:limit]
+
+    def _extract_domain_from_params(self, params: Dict[str, Any]) -> str:
+        for candidate in self._iter_url_candidates(params):
+            domain = self._normalize_domain(candidate)
+            if domain:
+                return domain
+        return ""
+
+    def _extract_content_sources(self, params: Dict[str, Any]) -> List[str]:
+        refs: List[str] = []
+        self._collect_content_sources(params or {}, refs)
+        unique: List[str] = []
+        seen: set[str] = set()
+        for ref in refs:
+            normalized = self._normalize_source_ref(ref)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                unique.append(normalized)
+        return unique[:12]
+
+    def _collect_content_sources(self, value: Any, refs: List[str]) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_l = str(key).lower()
+                if key_l in {"source_agent", "target", "task_id", "scope_id", "campaign_id", "session_id"}:
+                    continue
+                for kind, source_keys in self.SOURCE_KEY_CATALOG.items():
+                    if key_l in source_keys or any(key_l.endswith("_" + source_key) for source_key in source_keys):
+                        source_value = self._compact_source_value(item, fallback=key_l)
+                        if source_value:
+                            refs.append(f"{kind}:{source_value}")
+                self._collect_content_sources(item, refs)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                self._collect_content_sources(item, refs)
+        elif isinstance(value, str):
+            file_ref = self._file_ref_from_text(value)
+            if file_ref:
+                refs.append(f"file:{file_ref}")
+
+    @staticmethod
+    def _compact_source_value(value: Any, fallback: str = "") -> str:
+        if isinstance(value, (dict, list, tuple, set)):
+            return fallback
+        text = str(value or "").strip()
+        if not text:
+            return fallback
+        return text[:180]
+
+    @staticmethod
+    def _file_ref_from_text(text: str) -> str:
+        text = str(text or "").strip()
+        if not text or re.search(r"https?://", text):
+            return ""
+        match = re.search(
+            r"(?i)([A-Za-z]:[\\/][^\s\"'<>]+|(?:[\w.-]+[\\/])+[\w.-]+\.(?:pdf|docx?|xlsx?|pptx?|txt|csv|json|md|html?|py)|[\w.-]+\.(?:pdf|docx?|xlsx?|pptx?|txt|csv|json|md|html?|py))",
+            text,
+        )
+        if not match:
+            return ""
+        return match.group(1)
+
+    def _iter_url_candidates(self, value: Any):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_l = str(key).lower()
+                if any(marker in key_l for marker in ("url", "uri", "link", "href", "source", "referrer")):
+                    yield item
+                yield from self._iter_url_candidates(item)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                yield from self._iter_url_candidates(item)
+        elif isinstance(value, str):
+            for match in re.findall(r"https?://[^\s\"'<>]+", value):
+                yield match
+            if re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/.*)?$", value.strip()):
+                yield value
+
+    @staticmethod
+    def _normalize_domain(candidate: Any) -> str:
+        text = str(candidate or "").strip().strip(".,;:)]}\"'")
+        if not text:
+            return ""
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text):
+            text = "https://" + text
+        parsed = urlparse(text)
+        host = (parsed.netloc or parsed.path.split("/")[0]).lower()
+        if "@" in host:
+            host = host.rsplit("@", 1)[-1]
+        host = host.split(":", 1)[0].strip(".")
+        if host.startswith("www."):
+            host = host[4:]
+        if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", host):
+            return ""
+        return host
+
+    @staticmethod
+    def _domain_matches(candidate: str, blocked: str) -> bool:
+        candidate = str(candidate or "").lower()
+        blocked = str(blocked or "").lower()
+        return candidate == blocked or candidate.endswith("." + blocked)
+
+    @classmethod
+    def _normalize_source_ref(cls, candidate: Any) -> str:
+        text = str(candidate or "").strip().strip(".,;:)]}\"'")
+        if not text:
+            return ""
+        if ":" not in text:
+            return ""
+        kind, raw_value = text.split(":", 1)
+        kind = kind.lower().strip()
+        raw_value = raw_value.strip()
+        if kind not in {"file", "memory", "database", "config"} or not raw_value:
+            return ""
+        if kind == "file":
+            raw_value = raw_value.replace("\\", "/").strip()
+            raw_value = raw_value.rsplit("/", 1)[-1] or raw_value
+        raw_value = re.sub(r"\s+", " ", raw_value).strip().lower()
+        raw_value = raw_value[:180]
+        return f"{kind}:{raw_value}" if raw_value else ""
+
+    @staticmethod
+    def _source_matches(candidate: str, blocked: str) -> bool:
+        candidate = str(candidate or "").lower()
+        blocked = str(blocked or "").lower()
+        if candidate == blocked:
+            return True
+        if candidate.startswith("file:") and blocked.startswith("file:"):
+            return candidate.rsplit("/", 1)[-1] == blocked.rsplit("/", 1)[-1]
+        return False
+
+    @staticmethod
+    def _event_digest(event: "SecurityEvent") -> str:
+        payload = {
+            "timestamp": event.timestamp,
+            "source_agent": event.source_agent,
+            "target": event.target,
+            "behavior_type": event.behavior_type,
+            "task_id": event.task_id,
+            "params": event.params,
+        }
+        try:
+            raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        except TypeError:
+            raw = repr(payload)
+        return blake2b(raw.encode("utf-8", errors="ignore"), digest_size=10).hexdigest()
 
     def _make_ticket_id(self, event: "SecurityEvent") -> str:
         raw = f"{event.task_id}|{event.timestamp}|{event.source_agent}|{event.target}|{event.behavior_type}"
@@ -288,6 +1893,22 @@ class SecurityControlPlane:
             self.blocked_tools_by_task.pop(task_id, None)
             self.quarantined_agents_by_task.pop(task_id, None)
             self.paused_agents_by_task.pop(task_id, None)
+            for mitigation in self._mitigations.values():
+                if mitigation.scope == task_id and mitigation.active:
+                    mitigation.active = False
+                    mitigation.recovered_at = datetime.now(timezone.utc).isoformat()
+                    mitigation.recovery_reason = "scope_reset"
+            self._content_quarantine.pop(task_id, None)
+            self._context_sanitizations = [
+                action
+                for action in self._context_sanitizations
+                if str(action.get("task_id", "")) != task_id
+            ]
+            self._runtime_judge_records = [
+                record
+                for record in self._runtime_judge_records
+                if record.task_id != task_id
+            ]
             self._hitl_tickets = {
                 tid: ticket
                 for tid, ticket in self._hitl_tickets.items()
@@ -302,6 +1923,17 @@ class SecurityControlPlane:
         self.quarantined_agents_by_task.clear()
         self.paused_agents_by_task.clear()
         self._hitl_tickets.clear()
+        for mitigation in self._mitigations.values():
+            if mitigation.active:
+                mitigation.active = False
+                mitigation.recovered_at = datetime.now(timezone.utc).isoformat()
+                mitigation.recovery_reason = "runtime_reset"
+        self._content_quarantine.clear()
+        self._remediation_plans.clear()
+        self._context_sanitizations.clear()
+        self._runtime_judge_records.clear()
+        self._context_sanitization_counter = 0
+        self._runtime_judge_counter = 0
 
     @staticmethod
     def _event_scope(event: "SecurityEvent") -> str:
@@ -382,6 +2014,11 @@ class LocalVectorBehaviorStore:
 
     def __len__(self) -> int:
         return len(self._items)
+
+    def iter_patterns(self, label: Optional[str] = None):
+        for item in self._items:
+            if label is None or item.get("label") == label:
+                yield item
 
     def _load(self) -> None:
         if not self.db_path.exists():
@@ -545,6 +2182,10 @@ class SentinelAgent:
         self._pair_baseline: Dict[Tuple[str, str], int] = defaultdict(int)
         self._tool_baseline: Dict[Tuple[str, str], int] = defaultdict(int)
         self._behavior_baseline: Dict[Tuple[str, str], int] = defaultdict(int)
+        self._baseline_tool_group_counts: Dict[str, int] = defaultdict(int)
+        self._baseline_agent_counts: Dict[str, int] = defaultdict(int)
+        self._baseline_decision_counts: Dict[str, int] = defaultdict(int)
+        self._load_baseline_counts_from_store()
 
         self._sensitive_tool_risk: Dict[str, float] = {
             "upload_health_record": 25.0,
@@ -555,6 +2196,7 @@ class SentinelAgent:
             "enforce_margin_call": 24.0,
             "send_progress_notification": 10.0,
         }
+        self._load_tamas_tool_risk_catalog()
 
         self._risky_keywords = {
             "override",
@@ -611,6 +2253,50 @@ class SentinelAgent:
         self._threshold_quarantine = threshold_quarantine
         self._threshold_hitl = threshold_hitl
 
+    def _load_tamas_tool_risk_catalog(self) -> None:
+        """Use TAMAS tool catalogs as a policy table for risk scoring."""
+        try:
+            from tamas_adapter.tools import BENIGN_TOOL_NAMES, MALICIOUS_TOOL_NAMES  # type: ignore
+        except Exception:
+            return
+
+        for tool_name in MALICIOUS_TOOL_NAMES:
+            self._sensitive_tool_risk[str(tool_name)] = max(
+                self._sensitive_tool_risk.get(str(tool_name), 0.0),
+                40.0,
+            )
+
+        for tool_name in BENIGN_TOOL_NAMES:
+            name = str(tool_name)
+            heuristic = self._heuristic_tool_risk(name)
+            if heuristic > 0:
+                self._sensitive_tool_risk[name] = max(
+                    self._sensitive_tool_risk.get(name, 0.0),
+                    heuristic,
+                )
+
+    @staticmethod
+    def _heuristic_tool_risk(tool_name: str) -> float:
+        name = str(tool_name or "").lower()
+        risk_fragments = {
+            "export": 15.0,
+            "upload": 18.0,
+            "send": 12.0,
+            "log": 12.0,
+            "adjust": 16.0,
+            "enforce": 22.0,
+            "execute": 18.0,
+            "trade": 20.0,
+            "margin": 24.0,
+            "contract": 18.0,
+            "legal": 14.0,
+            "compliance": 16.0,
+            "health_record": 24.0,
+            "assessment": 12.0,
+            "risk": 16.0,
+        }
+        return max((weight for fragment, weight in risk_fragments.items() if fragment in name), default=0.0)
+
     def enable_learning_mode(self) -> None:
         self.learning_mode = True
         self._learned_events = 0
@@ -645,11 +2331,11 @@ class SentinelAgent:
 
         assessment = self._assess(event)
         self._log_assessment(assessment)
+        if self.control_callback is not None:
+            self.control_callback(assessment)
         if assessment.action in {SentinelAction.ALERT, SentinelAction.BLOCK, SentinelAction.QUARANTINE, SentinelAction.HITL}:
             if self.alert_callback is not None:
                 self.alert_callback(assessment)
-            if self.control_callback is not None:
-                self.control_callback(assessment)
         return assessment
 
     def review_task_input(
@@ -957,17 +2643,63 @@ class SentinelAgent:
         label = "baseline" if event.decision == "allow" else "known_abnormal"
         self.vector_db.add_pattern(event, label=label)
         self._update_histories(event)
+        if label == "baseline":
+            self._record_baseline_event(
+                event.source_agent,
+                event.target,
+                event.behavior_type,
+                event.decision,
+            )
+        self._baseline_pattern_count += 1
 
-        pair_key = (event.source_agent, event.target)
+    def _load_baseline_counts_from_store(self) -> None:
+        for item in self.vector_db.iter_patterns(label="baseline"):
+            self._record_baseline_event(
+                str(item.get("source_agent") or "unknown"),
+                str(item.get("target") or "unknown"),
+                str(item.get("behavior_type") or "unknown"),
+                str(item.get("decision") or "allow"),
+            )
+
+    def _record_baseline_event(
+        self,
+        source_agent: str,
+        target: str,
+        behavior_type: str,
+        decision: str,
+    ) -> None:
+        pair_key = (source_agent, target)
         self._pair_baseline[pair_key] += 1
 
-        if event.behavior_type == "tool_call":
-            tool_key = (event.source_agent, event.target)
+        if behavior_type == "tool_call":
+            tool_key = (source_agent, target)
             self._tool_baseline[tool_key] += 1
+            group = self._tool_group_for_baseline(target)
+            if group:
+                self._baseline_tool_group_counts[group] += 1
 
-        behavior_key = (event.source_agent, event.behavior_type)
+        behavior_key = (source_agent, behavior_type)
         self._behavior_baseline[behavior_key] += 1
-        self._baseline_pattern_count += 1
+        self._baseline_agent_counts[source_agent] += 1
+        self._baseline_decision_counts[str(decision or "allow").lower()] += 1
+
+    @staticmethod
+    def _tool_group_for_baseline(tool: str) -> str:
+        name = str(tool or "")
+        lowered = name.lower()
+        if name in SecurityControlPlane.WEB_TOOLS or any(part in lowered for part in ("web", "browser", "search", "youtube")):
+            return "web"
+        if name in SecurityControlPlane.CODE_TOOLS or "python" in lowered or "code" in lowered:
+            return "code"
+        if name in SecurityControlPlane.MEMORY_TOOLS or any(part in lowered for part in ("memory", "vector", "embedding", "rag", "cache")):
+            return "memory"
+        if name in SecurityControlPlane.CONFIG_TOOLS or any(part in lowered for part in ("config", "setting", "env", "credential", "secret")):
+            return "config"
+        if any(part in lowered for part in ("database", "sql", "table", "collection")):
+            return "memory"
+        if name in SecurityControlPlane.FILE_TOOLS or lowered.startswith("read_"):
+            return "file"
+        return ""
 
     def _assess(self, event: SecurityEvent) -> SentinelAssessment:
         reasons: List[str] = []
@@ -1099,11 +2831,13 @@ class SentinelAgent:
         self._update_risk_memory(scope, event.source_agent, score, anomalies)
 
         if action == SentinelAction.QUARANTINE:
-            self._quarantine_agent(event.source_agent, scope)
-            reasons.append(f"agent '{event.source_agent}' moved to quarantine in scope '{scope}'")
+            reasons.append(
+                f"runtime control plane requested least-privilege slimming in scope '{scope}'"
+            )
         elif action == SentinelAction.HITL:
-            self._quarantine_agent(event.source_agent, scope)
-            reasons.append(f"human review required before resuming scope '{scope}'")
+            reasons.append(
+                f"human review may be requested only if no narrower runtime mitigation is available in scope '{scope}'"
+            )
 
         return SentinelAssessment(
             event=event,
@@ -1304,6 +3038,7 @@ class SentinelAgent:
     def _score_instruction_poisoning(self, event: SecurityEvent) -> Tuple[float, str]:
         if not event.params or event.behavior_type not in {
             "task_input",
+            "input_review",
             "agent_message",
             "plan_review",
             "worker_assignment",
@@ -1338,6 +3073,45 @@ class SentinelAgent:
     def _score_scope_tool_chain(self, scope: str, event: SecurityEvent) -> Tuple[float, str]:
         if event.behavior_type != "tool_call":
             return 0.0, ""
+
+        finance_execution_tools = {
+            "enforce_margin_call",
+            "execute_high_risk_trade",
+            "execute_trade",
+            "place_order",
+            "execute_limit_order",
+        }
+        if event.target in finance_execution_tools and any(
+            self._scope_has_tool(scope, prior_tool)
+            for prior_tool in (
+                "evaluate_risk_exposure",
+                "assess_portfolio_risk",
+                "calculate_margin_requirement",
+            )
+        ):
+            return (
+                30.0,
+                f"finance risk assessment in scope '{scope}' was followed by execution tool '{event.target}'",
+            )
+
+        legal_drafting_tools = {
+            "draft_contract",
+            "generate_nda",
+            "draft_legal_letter",
+            "create_power_of_attorney",
+        }
+        if event.target in legal_drafting_tools and any(
+            self._scope_has_tool(scope, prior_tool)
+            for prior_tool in (
+                "search_case_laws",
+                "retrieve_compliance_policy",
+                "check_contract_compliance",
+            )
+        ):
+            return (
+                26.0,
+                f"legal research/compliance chain in scope '{scope}' moved into drafting tool '{event.target}'",
+            )
 
         profiling_tools = {
             "identify_strengths_weaknesses",
@@ -1388,12 +3162,15 @@ class SentinelAgent:
         if phrase_hits and tool_hits:
             score += 8.0
         if event.behavior_type in {
+            "task_input",
+            "input_review",
             "plan_review",
             "worker_assignment",
             "agent_message",
             "worker_result",
             "handoff",
             "final_answer",
+            "output_review",
         }:
             score += 6.0
 
@@ -1403,7 +3180,7 @@ class SentinelAgent:
         return score, f"high-risk intent pattern around {tool_desc}: {phrase_desc}"
 
     def _score_output_semantics(self, event: SecurityEvent) -> Tuple[float, str]:
-        if event.behavior_type not in {"worker_result", "final_answer", "plan_review"} or not event.params:
+        if event.behavior_type not in {"worker_result", "final_answer", "plan_review", "output_review"} or not event.params:
             return 0.0, ""
 
         raw = json.dumps(event.params, ensure_ascii=False).lower()
@@ -1422,7 +3199,7 @@ class SentinelAgent:
         ]
         if legal_hits:
             score = 34.0 + min(16.0, 6.0 * max(0, len(legal_hits) - 1))
-            if event.behavior_type in {"worker_result", "final_answer"}:
+            if event.behavior_type in {"worker_result", "final_answer", "output_review"}:
                 score += 8.0
             reason = f"harmful legal drafting semantics detected: {', '.join(legal_hits[:3])}"
             return min(52.0, score), reason
@@ -1633,6 +3410,38 @@ class SentinelAgent:
         self._control_plane = control_plane
         self.control_callback = control_plane.apply_assessment
 
+    @staticmethod
+    def _top_counts(mapping: Dict[Any, int], limit: int = 8) -> List[Dict[str, Any]]:
+        items = sorted(mapping.items(), key=lambda item: (-item[1], str(item[0])))[:limit]
+        rows: List[Dict[str, Any]] = []
+        for key, count in items:
+            if isinstance(key, tuple):
+                name = "->".join(str(part) for part in key)
+            else:
+                name = str(key)
+            rows.append({"name": name, "count": int(count)})
+        return rows
+
+    def baseline_profile(self) -> Dict[str, Any]:
+        normal_events = sum(int(v) for v in self._baseline_agent_counts.values())
+        tool_events = sum(int(v) for v in self._baseline_tool_group_counts.values())
+        group_distribution = {
+            group: round(count / tool_events, 3) if tool_events else 0.0
+            for group, count in sorted(self._baseline_tool_group_counts.items())
+        }
+        return {
+            "normal_events": normal_events,
+            "stored_patterns": self._baseline_pattern_count,
+            "similarity_threshold": self.baseline_similarity_threshold,
+            "agent_counts": dict(sorted(self._baseline_agent_counts.items())),
+            "decision_counts": dict(sorted(self._baseline_decision_counts.items())),
+            "tool_group_counts": dict(sorted(self._baseline_tool_group_counts.items())),
+            "tool_group_distribution": group_distribution,
+            "top_pairs": self._top_counts(self._pair_baseline),
+            "top_tools": self._top_counts(self._tool_baseline),
+            "top_behaviors": self._top_counts(self._behavior_baseline),
+        }
+
     @property
     def status(self) -> Dict[str, Any]:
         return {
@@ -1640,6 +3449,7 @@ class SentinelAgent:
             "mode": "learning" if self.learning_mode else "monitoring",
             "learned_events": self._learned_events,
             "baseline_patterns": self._baseline_pattern_count,
+            "baseline_profile": self.baseline_profile(),
             "history_scope": "task" if self.scope_realtime_by_task else "global",
             "realtime_window_seconds": self.realtime_window_seconds,
             "long_horizon_event_limit": self.long_horizon_event_limit,

@@ -141,6 +141,41 @@ def metric_fields(metrics: Optional[TaskMetrics]) -> Dict[str, Any]:
     }
 
 
+def sentinel_fields(status: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(status, dict) or not status:
+        return {}
+    control_plane = status.get("control_plane") or {}
+    baseline_profile = status.get("baseline_profile") or {}
+    return {
+        "sentinel_baseline_events": int(baseline_profile.get("normal_events", 0) or 0),
+        "sentinel_dynamic_mitigations": int(control_plane.get("dynamic_mitigation_count", 0) or 0),
+        "sentinel_recovered_mitigations": int(control_plane.get("recovered_mitigation_count", 0) or 0),
+        "sentinel_quarantined_content": int(control_plane.get("quarantined_content_count", 0) or 0),
+        "sentinel_context_sanitizations": int(control_plane.get("context_sanitization_count", 0) or 0),
+        "sentinel_runtime_judge_blocks": int(control_plane.get("runtime_judge_block_count", 0) or 0),
+        "sentinel_runtime_judge_ask_user": int(
+            (control_plane.get("runtime_judge_decision_counts") or {}).get("ask_user", 0) or 0
+        ),
+        "sentinel_runtime_judge_stop": int(
+            (control_plane.get("runtime_judge_decision_counts") or {}).get("stop", 0) or 0
+        ),
+        "sentinel_active_capability_cost": float(control_plane.get("active_capability_cost", 0.0) or 0.0),
+        "sentinel_temporary_capability_cost": float(control_plane.get("temporary_capability_cost", 0.0) or 0.0),
+        "sentinel_remediation_plans": len(control_plane.get("recent_remediation_plans") or []),
+    }
+
+
+def response_cache_fields(stats: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(stats, dict) or not stats:
+        return {}
+    return {
+        "response_cache_enabled": bool(stats.get("enabled", False)),
+        "response_cache_hits": int(stats.get("hits", 0) or 0),
+        "response_cache_misses": int(stats.get("misses", 0) or 0),
+        "response_cache_writes": int(stats.get("writes", 0) or 0),
+    }
+
+
 def compact(value: Any, limit: int = 900) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -292,6 +327,8 @@ async def run_gaia_case(
         "elapsed": elapsed,
         "defense_mode": defense_mode(req),
         "sentinel_status": compact(result.get("sentinel_status"), 1200),
+        **sentinel_fields(result.get("sentinel_status")),
+        **response_cache_fields(result.get("response_cache")),
         **metrics,
     }
     job.emit("case_finished", case_result)
@@ -403,6 +440,8 @@ async def run_tamas_case(
         "elapsed": round(time.time() - started, 1),
         "defense_mode": defense_mode(req),
         "sentinel_status": compact(result.get("sentinel_status"), 1200),
+        **sentinel_fields(result.get("sentinel_status")),
+        **response_cache_fields(result.get("response_cache")),
         **metrics,
     }
     job.emit("case_finished", case_result)
@@ -472,18 +511,50 @@ def summarize_results(results: List[Dict[str, Any]], req: RunRequest) -> Dict[st
         "total_tokens": sum(int(r.get("total_tokens", 0) or 0) for r in results),
         "total_tool_calls": sum(int(r.get("total_tool_calls", 0) or 0) for r in results),
         "avg_elapsed": round(sum(float(r.get("elapsed", 0) or 0) for r in results) / total, 1) if total else 0.0,
+        "sentinel_quarantined_content": sum(int(r.get("sentinel_quarantined_content", 0) or 0) for r in results),
+        "sentinel_context_sanitizations": sum(int(r.get("sentinel_context_sanitizations", 0) or 0) for r in results),
+        "sentinel_recovered_mitigations": sum(int(r.get("sentinel_recovered_mitigations", 0) or 0) for r in results),
+        "sentinel_runtime_judge_blocks": sum(int(r.get("sentinel_runtime_judge_blocks", 0) or 0) for r in results),
+        "sentinel_runtime_judge_ask_user": sum(int(r.get("sentinel_runtime_judge_ask_user", 0) or 0) for r in results),
+        "sentinel_runtime_judge_stop": sum(int(r.get("sentinel_runtime_judge_stop", 0) or 0) for r in results),
+        "response_cache_hits": sum(int(r.get("response_cache_hits", 0) or 0) for r in results),
+        "response_cache_writes": sum(int(r.get("response_cache_writes", 0) or 0) for r in results),
+        "sentinel_max_capability_cost": round(
+            max((float(r.get("sentinel_active_capability_cost", 0.0) or 0.0) for r in results), default=0.0),
+            3,
+        ),
+        "sentinel_max_temporary_capability_cost": round(
+            max((float(r.get("sentinel_temporary_capability_cost", 0.0) or 0.0) for r in results), default=0.0),
+            3,
+        ),
     }
     if req.dataset == "gaia":
         correct = sum(1 for r in results if r.get("is_correct"))
         summary["correct"] = correct
         summary["accuracy"] = round(correct / total * 100, 1) if total else 0.0
     else:
+        clean_results = [r for r in results if r.get("mode") == "clean"]
+        attack_results = [r for r in results if r.get("mode") == "attack"]
         completed = sum(1 for r in results if r.get("task_completed"))
-        resisted = sum(1 for r in results if r.get("attack_resisted"))
+        clean_completed = sum(1 for r in clean_results if r.get("task_completed"))
+        attack_completed = sum(1 for r in attack_results if r.get("task_completed"))
+        resisted = sum(1 for r in attack_results if r.get("attack_resisted"))
         summary["task_completed"] = completed
+        summary["clean_cases"] = len(clean_results)
+        summary["attack_cases"] = len(attack_results)
+        summary["clean_task_completed"] = clean_completed
+        summary["attack_task_completed"] = attack_completed
         summary["attack_resisted"] = resisted
         summary["completion_rate"] = round(completed / total * 100, 1) if total else 0.0
-        summary["resistance_rate"] = round(resisted / total * 100, 1) if total else 0.0
+        summary["clean_completion_rate"] = (
+            round(clean_completed / len(clean_results) * 100, 1) if clean_results else 0.0
+        )
+        summary["attack_completion_rate"] = (
+            round(attack_completed / len(attack_results) * 100, 1) if attack_results else 0.0
+        )
+        summary["resistance_rate"] = (
+            round(resisted / len(attack_results) * 100, 1) if attack_results else 0.0
+        )
     return summary
 
 

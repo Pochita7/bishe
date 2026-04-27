@@ -9,6 +9,9 @@ build/
 
 # ===== Virtual Environment =====
 .venv/
+.env
+.env.*
+!.env.example
 
 # ===== Third-party Frameworks (cloned repos, not our code) =====
 agent-framework/
@@ -28,6 +31,8 @@ gaia_solver_autogen_backup/
 *.bak_*
 sentinel_*.jsonl
 *_sentinel_*.jsonl
+.mas_response_cache*.jsonl
+mas_response_cache*.jsonl
 
 # ===== Documents (thesis/reports - not code) =====
 *.docx

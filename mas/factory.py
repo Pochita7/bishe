@@ -429,6 +429,7 @@ def create_tamas_team(
         setattr(team, "security_event_bus", security_event_bus)
         setattr(team, "sentinel", sentinel)
         setattr(team, "sentinel_control_plane", sentinel_control_plane)
+    if guardian is not None:
         setattr(team, "guardian", guardian)
 
     if verbose:

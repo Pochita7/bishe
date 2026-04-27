@@ -20,16 +20,24 @@ MASTeam — 多智能体团队编排引擎（手动编排版）
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
+from types import SimpleNamespace
 from typing import List, Optional, Dict, Any, Tuple
 
 from agent_framework import Agent, FunctionTool
 from agent_framework.openai import OpenAIChatClient
 
 from .metrics import MetricsCollector, MetricsLogger, TaskMetrics
+from .response_cache import ResponseCache, stable_digest
 from .sentinel import SecurityControlPlane, SecurityEventBus
 from token_accounting import push_tracker, reset_tracker, snapshot_tracker
+
+
+_SUSPENDED_BY_SENTINEL = "Execution suspended by Sentinel"
+_SUSPENDED_BY_GUARDIAN = "Execution suspended by Guardian"
+_CACHE_SECURITY_VERSION = 2
 
 
 class _PartialResponse:
@@ -38,6 +46,30 @@ class _PartialResponse:
         self.usage_details = usage_details
         self.messages = []
         self.text = ""
+
+
+class _CachedResponse:
+    """Pseudo-response for cached agent outputs.
+
+    Usage is zero because no API call was made. Function-call names are replayed
+    into a lightweight message shape so existing metrics still see the original
+    tool-call count.
+    """
+
+    def __init__(self, text: str, tool_names: Optional[List[str]] = None, cache_key: str = ""):
+        self.usage_details = {
+            "input_token_count": 0,
+            "output_token_count": 0,
+            "total_token_count": 0,
+        }
+        self.text = text
+        self.cached_response = True
+        self.cache_key = cache_key
+        contents = [
+            SimpleNamespace(type="function_call", name=str(name or "unknown"))
+            for name in (tool_names or [])
+        ]
+        self.messages = [SimpleNamespace(contents=contents)] if contents else []
 
 
 # ============================================================
@@ -84,6 +116,7 @@ class MASTeam:
         self._active_external_usage_tracker: Optional[Dict[str, Any]] = None
         self._active_expected_answer = ""
         self._active_planner_rounds = 0
+        self.response_cache = ResponseCache.from_env()
 
         # ---- 构建 Agent 信息摘要 ----
         self._agent_info = self._build_agent_info(workers)
@@ -106,7 +139,7 @@ class MASTeam:
             client=client,
             name="_Selector",
             instructions=selector_prompt,
-            default_options={"temperature": 0},
+            default_options=self._agent_default_options(),
         )
         self._agents["_Selector"] = self._selector_agent
 
@@ -196,6 +229,290 @@ class MASTeam:
             )
         return directive
 
+    @staticmethod
+    def _guardian_action(decision: Any) -> str:
+        action = getattr(decision, "action", "")
+        return str(getattr(action, "value", action) or "").lower()
+
+    @staticmethod
+    def _guardian_rules(decision: Any) -> List[str]:
+        return list(getattr(decision, "matched_rules", None) or [])
+
+    @staticmethod
+    def _guardian_reason(decision: Any) -> str:
+        return str(getattr(decision, "reason", "") or "")
+
+    def _guardian_gate(
+        self,
+        gate: str,
+        text: str,
+        *,
+        source_agent: str,
+        target: str,
+    ) -> Tuple[str, str, str, List[str]]:
+        guardian = getattr(self, "guardian", None)
+        if guardian is None:
+            return text, "", "", []
+
+        if gate == "input":
+            decision = guardian.check_input(text)
+        elif gate == "plan":
+            decision = guardian.check_plan(text)
+        elif gate == "output":
+            try:
+                decision = guardian.check_output(
+                    text,
+                    source_agent=source_agent,
+                    target=target,
+                )
+            except TypeError:
+                decision = guardian.check_output(text)
+        else:
+            return text, "", "", []
+
+        action = self._guardian_action(decision)
+        reason = self._guardian_reason(decision)
+        rules = self._guardian_rules(decision)
+        if action == "sanitize":
+            effective = (
+                getattr(decision, "sanitized_full", "")
+                or getattr(decision, "modified_content", "")
+                or text
+            )
+            return str(effective), action, reason, rules
+        return text, action, reason, rules
+
+    def _guardian_notice(self, action: str, phase: str, reason: str) -> str:
+        reason_text = reason or "security policy"
+        if action == "block":
+            return f"[Guardian blocked {phase}: {reason_text}]"
+        if action == "sanitize":
+            return f"[Guardian sanitized {phase}: {reason_text}]"
+        return ""
+
+    def _sanitize_context(
+        self,
+        items: List[Any],
+        *,
+        label: str,
+    ) -> List[Any]:
+        if self.sentinel_control_plane is None or not hasattr(
+            self.sentinel_control_plane,
+            "sanitize_runtime_context",
+        ):
+            return items
+        sanitized, actions = self.sentinel_control_plane.sanitize_runtime_context(
+            items,
+            self._current_task_id,
+        )
+        if actions:
+            self._publish_security_event(
+                source_agent="Sentinel",
+                target="MASTeam",
+                behavior_type="output_review",
+                params={
+                    "context_label": label,
+                    "sanitized_count": len(actions),
+                    "cleanup_actions": actions[:5],
+                },
+                gate="ContextSanitizer",
+                decision="sanitize",
+                reason=f"removed {len(actions)} quarantined prompt/output fragment(s)",
+                matched_rules=["SENTINEL_CONTEXT_SANITIZED"],
+            )
+        return sanitized
+
+    def _guardian_review_output(
+        self,
+        source_agent: str,
+        target: str,
+        text: str,
+        *,
+        phase: str,
+    ) -> Tuple[str, str, str]:
+        reviewed_text, action, reason, _rules = self._guardian_gate(
+            "output",
+            text,
+            source_agent=source_agent,
+            target=target,
+        )
+        if action == "block":
+            return self._guardian_notice("block", phase, reason), action, reason
+        if action == "sanitize":
+            return reviewed_text, action, reason
+        return text, action or "allow", reason
+
+    def _agent_cache_fingerprint(self, agent_name: str) -> Dict[str, Any]:
+        agent = self._agents.get(agent_name)
+        tool_specs: List[Dict[str, str]] = []
+        for tool in getattr(agent, "tools", None) or []:
+            tool_specs.append(
+                {
+                    "name": str(getattr(tool, "name", "") or ""),
+                    "description_hash": stable_digest(
+                        str(getattr(tool, "description", "") or ""),
+                        digest_size=8,
+                    ),
+                }
+            )
+
+        model_name = ""
+        for attr in ("model", "model_name", "model_id", "deployment_name"):
+            value = getattr(self.client, attr, None)
+            if value:
+                model_name = str(value)
+                break
+        if not model_name:
+            try:
+                from gaia_solver.config import MODEL_NAME  # type: ignore
+
+                model_name = str(MODEL_NAME)
+            except Exception:
+                model_name = ""
+
+        instructions = str(
+            getattr(agent, "instructions", "")
+            or getattr(agent, "_instructions", "")
+            or ""
+        )
+        options = getattr(agent, "default_options", None) or getattr(agent, "_default_options", None) or {}
+        try:
+            options_text = json.dumps(options, ensure_ascii=False, sort_keys=True, default=str)
+        except TypeError:
+            options_text = repr(options)
+        security_policy = self._cache_security_policy_fingerprint()
+        return {
+            "cache_security_version": _CACHE_SECURITY_VERSION,
+            "agent": agent_name,
+            "model": model_name,
+            "instructions_hash": stable_digest(instructions, digest_size=12),
+            "options_hash": stable_digest(options_text, digest_size=8),
+            "tools": sorted(tool_specs, key=lambda item: item["name"]),
+            "guardian": bool(getattr(self, "guardian", None)),
+            "sentinel": bool(self.sentinel_control_plane),
+            "security_policy": security_policy,
+            "max_tool_calls_per_worker": self.max_tool_calls_per_worker,
+        }
+
+    def _cache_security_policy_fingerprint(self) -> Dict[str, Any]:
+        if self.sentinel_control_plane is None:
+            return {"policy_hash": "", "task_id": self._current_task_id or ""}
+        try:
+            snapshot = self.sentinel_control_plane.snapshot()
+        except Exception:
+            return {"policy_hash": "snapshot_error", "task_id": self._current_task_id or ""}
+
+        task_id = self._current_task_id or ""
+        active = []
+        for item in snapshot.get("active_mitigations", []) or []:
+            scope = str(item.get("scope", "") or "")
+            if scope and task_id and scope != task_id:
+                continue
+            active.append(
+                {
+                    "kind": str(item.get("kind", "") or ""),
+                    "target": str(item.get("target", "") or ""),
+                    "scope": scope,
+                    "persistent": bool(item.get("persistent", False)),
+                }
+            )
+        policy = {
+            "active_mitigations": sorted(
+                active,
+                key=lambda item: (item["kind"], item["target"], item["scope"]),
+            ),
+            "blocked_domains": sorted(snapshot.get("blocked_domains", []) or []),
+            "blocked_sources": sorted(snapshot.get("blocked_sources", []) or []),
+            "task_scoped_blocked_domains": sorted(
+                (snapshot.get("task_scoped_blocked_domains", {}) or {}).get(task_id, []) or []
+            ),
+            "task_scoped_blocked_sources": sorted(
+                (snapshot.get("task_scoped_blocked_sources", {}) or {}).get(task_id, []) or []
+            ),
+        }
+        return {
+            "task_id": task_id,
+            "policy_hash": stable_digest(policy, digest_size=12),
+        }
+
+    @staticmethod
+    def _replay_cached_tool_log(tool_names: List[str]) -> None:
+        if not tool_names:
+            return
+        try:
+            from tamas_adapter.tools import replay_tool_call_log  # type: ignore
+
+            replay_tool_call_log(tool_names)
+        except Exception:
+            return
+
+    def _validate_cached_tool_replay(
+        self,
+        agent_name: str,
+        tool_names: List[str],
+        cache_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not tool_names:
+            return None
+
+        guardian = getattr(self, "guardian", None)
+        for tool_name_raw in tool_names:
+            tool_name = str(tool_name_raw or "unknown")
+            params = {
+                "tool_name": tool_name,
+                "source_agent": agent_name,
+                "cached_replay": True,
+                "cache_key": cache_key,
+            }
+            if self._current_task_id:
+                params["task_id"] = self._current_task_id
+
+            if guardian is not None and hasattr(guardian, "check_tool_call"):
+                decision = guardian.check_tool_call(
+                    tool_name,
+                    dict(params),
+                    source_agent=agent_name,
+                )
+                action = self._guardian_action(decision)
+                if action == "block":
+                    return {
+                        "action": "block",
+                        "source": "Guardian",
+                        "reason": self._guardian_reason(decision) or "cached tool replay blocked",
+                        "matched_rules": self._guardian_rules(decision),
+                    }
+                if self.sentinel_control_plane is not None:
+                    directive = self.sentinel_control_plane.get_runtime_directive(
+                        source_agent=agent_name,
+                        target=tool_name,
+                        behavior_type="tool_call",
+                        params=params,
+                    )
+                    if directive:
+                        return directive
+                continue
+
+            directive = self._monitor_behavior(
+                source_agent=agent_name,
+                target=tool_name,
+                behavior_type="tool_call",
+                params=params,
+                gate="CacheReplay",
+                enforce=True,
+            )
+            if directive:
+                return directive
+        return None
+
+    @staticmethod
+    def _agent_default_options() -> Dict[str, Any]:
+        try:
+            from gaia_solver.config import get_chat_default_options
+
+            return get_chat_default_options(temperature=0)
+        except Exception:
+            return {"temperature": 0}
+
     # --------------------------------------------------------
     # 构建
     # --------------------------------------------------------
@@ -219,7 +536,7 @@ class MASTeam:
             instructions=planner_sys,
             name=planner["name"],
             description=planner.get("description", "Planner"),
-            default_options={"temperature": 0},
+            default_options=self._agent_default_options(),
         )
         self._agents[planner["name"]] = planner_agent
         self._agent_list.append(planner_agent)
@@ -233,7 +550,7 @@ class MASTeam:
                 name=w["name"],
                 description=w.get("description", w["name"]),
                 tools=tools if tools else None,
-                default_options={"temperature": 0},
+                default_options=self._agent_default_options(),
             )
             self._agents[w["name"]] = agent
             self._agent_list.append(agent)
@@ -359,6 +676,50 @@ class MASTeam:
         if not agent:
             return f"[Error: unknown agent '{agent_name}']", None
 
+        cache_key = ""
+        cache_fingerprint: Dict[str, Any] = {}
+        if self.response_cache.enabled:
+            cache_fingerprint = self._agent_cache_fingerprint(agent_name)
+            cache_key = self.response_cache.make_key(
+                agent_name=agent_name,
+                prompt=prompt,
+                fingerprint=cache_fingerprint,
+            )
+            cached = self.response_cache.get(cache_key)
+            if cached is not None:
+                tool_names = list(cached.get("tool_names") or [])
+                cache_directive = self._validate_cached_tool_replay(
+                    agent_name,
+                    tool_names,
+                    cache_key,
+                )
+                if cache_directive:
+                    source = str(cache_directive.get("source", "Sentinel") or "Sentinel")
+                    reason = str(cache_directive.get("reason", "cached tool replay blocked") or "cached tool replay blocked")
+                    blocked_text = f"[{source} blocked cached response for {agent_name}: {reason}]"
+                    if self.verbose:
+                        print(f"    [CACHE BLOCKED] {agent_name}: {reason}")
+                    return (
+                        blocked_text,
+                        _CachedResponse(
+                            blocked_text,
+                            tool_names=[],
+                            cache_key=cache_key,
+                        ),
+                    )
+                self._replay_cached_tool_log(tool_names)
+                if self.verbose:
+                    print(f"    [CACHE HIT] {agent_name}")
+                cached_text = str(cached.get("text", ""))
+                return (
+                    cached_text,
+                    _CachedResponse(
+                        cached_text,
+                        tool_names=tool_names,
+                        cache_key=cache_key,
+                    ),
+                )
+
         # 设置 token 追踪器 — FunctionInvocationLayer 会在每次 API 调用后更新它
         from agent_framework._tools import _token_usage_tracker
         usage_tracker: dict = {'usage': None}
@@ -370,16 +731,27 @@ class MASTeam:
             text = result.text if hasattr(result, "text") else str(result)
 
             # ---- 工具调用上限检查 ----
-            tool_count = 0
+            tool_names: List[str] = []
             messages = getattr(result, "messages", [])
             for msg in messages:
                 contents = getattr(msg, "contents", [])
                 for content in contents:
                     if getattr(content, "type", None) == "function_call":
-                        tool_count += 1
+                        tool_names.append(str(getattr(content, "name", None) or "unknown"))
+            tool_count = len(tool_names)
 
             if tool_count > self.max_tool_calls_per_worker and self.verbose:
                 print(f"    [WARN] {agent_name} made {tool_count} tool calls (limit: {self.max_tool_calls_per_worker})")
+
+            if cache_key:
+                self.response_cache.put(
+                    cache_key,
+                    agent_name=agent_name,
+                    prompt=prompt,
+                    fingerprint=cache_fingerprint,
+                    text=text,
+                    tool_names=tool_names,
+                )
 
             return text, result
         except asyncio.TimeoutError:
@@ -525,6 +897,11 @@ class MASTeam:
                     print(f"    [Sentinel]: {blocked_text}")
                 break
 
+            worker_results[:] = self._sanitize_context(
+                worker_results,
+                label="handoff_worker_results",
+            )
+            history[:] = self._sanitize_context(history, label="handoff_history")
             handoff_prompt = self._build_worker_prompt(task, handoff_task, worker_results)
             t0 = time.time()
             worker_text, worker_resp = await self._invoke_agent(
@@ -533,6 +910,24 @@ class MASTeam:
             collector.record_agent_call(
                 target_name, worker_resp, time.time() - t0, is_planner=False
             )
+            worker_text, output_action, output_reason = self._guardian_review_output(
+                target_name,
+                self._planner_name,
+                worker_text,
+                phase=f"handoff result from {target_name}",
+            )
+            if output_action in {"sanitize", "block"}:
+                notice = self._guardian_notice(
+                    output_action,
+                    f"handoff result from {target_name}",
+                    output_reason,
+                )
+                history.append({"source": "Guardian", "content": notice})
+                if self.verbose:
+                    print(f"    [Guardian]: {notice}")
+                if output_action == "block":
+                    worker_results.append((target_name, worker_text))
+                    break
             result_directive = self._monitor_behavior(
                 source_agent=target_name,
                 target=self._planner_name,
@@ -680,7 +1075,44 @@ class MASTeam:
             "task_id": task_id,
             "task_preview": self._trim_text(task, 320),
         }
-        if sentinel is not None and hasattr(sentinel, "review_task_input"):
+        task, guardian_action, guardian_reason, guardian_rules = self._guardian_gate(
+            "input",
+            task,
+            source_agent="User",
+            target=self._planner_name,
+        )
+        if guardian_action == "sanitize":
+            collector.task = task
+            task_input_decision = "sanitize"
+            task_input_reason = guardian_reason or "Guardian sanitized task input"
+            task_input_rules = list(guardian_rules)
+            task_input_params = {
+                "task_id": task_id,
+                "task_preview": self._trim_text(task, 320),
+                "sanitized": True,
+                "sanitization_reason": task_input_reason,
+                "guardian_gate": "InputGate",
+            }
+            notice = self._guardian_notice("sanitize", "task input", task_input_reason)
+            history.append({"source": "Guardian", "content": notice})
+            if self.verbose:
+                print(f"  [Guardian]: {notice}")
+        elif guardian_action == "block":
+            task_input_decision = "block"
+            task_input_reason = guardian_reason or "Guardian blocked task input"
+            task_input_rules = list(guardian_rules)
+            task_input_params = {
+                "task_id": task_id,
+                "task_preview": "[withheld_by_guardian]",
+                "guardian_gate": "InputGate",
+            }
+            notice = self._guardian_notice("block", "task input", task_input_reason)
+            history.append({"source": "Guardian", "content": notice})
+            final_answer = _SUSPENDED_BY_GUARDIAN
+            if self.verbose:
+                print(f"  [Guardian]: {notice}")
+
+        if not final_answer and sentinel is not None and hasattr(sentinel, "review_task_input"):
             task_review = sentinel.review_task_input(
                 task,
                 task_id=self._current_task_id,
@@ -716,7 +1148,7 @@ class MASTeam:
                 }
                 blocked_text = f"[Sentinel paused task input: {task_input_reason}]"
                 history.append({"source": "Sentinel", "content": blocked_text})
-                final_answer = "Execution suspended by Sentinel"
+                final_answer = _SUSPENDED_BY_SENTINEL
                 if self.verbose:
                     print(f"  [Sentinel]: {blocked_text}")
 
@@ -739,6 +1171,11 @@ class MASTeam:
             if round_num == 0:
                 planner_prompt = self._build_planner_plan_prompt(task)
             else:
+                history = self._sanitize_context(history, label="planner_history")
+                worker_results = self._sanitize_context(
+                    worker_results,
+                    label="planner_review_worker_results",
+                )
                 planner_prompt = self._build_planner_review_prompt(
                     task, last_plan_text, worker_results
                 )
@@ -755,7 +1192,7 @@ class MASTeam:
                 gate="PlannerDispatch",
             )
             if planner_directive:
-                final_answer = "Execution suspended by Sentinel"
+                final_answer = _SUSPENDED_BY_SENTINEL
                 blocked_text = (
                     f"[Sentinel blocked {self._planner_name}: "
                     f"{planner_directive.get('reason', 'execution suspended')}]"
@@ -775,7 +1212,46 @@ class MASTeam:
             planner_rounds += 1
             self._active_planner_rounds = planner_rounds
 
+            planner_text, plan_guardian_action, plan_guardian_reason, _plan_guardian_rules = self._guardian_gate(
+                "plan",
+                planner_text,
+                source_agent=self._planner_name,
+                target="MASTeam",
+            )
+            if plan_guardian_action in {"sanitize", "block"}:
+                notice = self._guardian_notice(
+                    plan_guardian_action,
+                    "planner output",
+                    plan_guardian_reason,
+                )
+                history.append({"source": "Guardian", "content": notice})
+                if self.verbose:
+                    print(f"  [Guardian]: {notice}")
+                if plan_guardian_action == "block":
+                    final_answer = _SUSPENDED_BY_GUARDIAN
+                    break
+
             fa = self._extract_final_answer(planner_text)
+            if fa and round_num > 0:
+                planner_text, final_guardian_action, final_guardian_reason = self._guardian_review_output(
+                    self._planner_name,
+                    "User",
+                    planner_text,
+                    phase="planner final answer",
+                )
+                if final_guardian_action in {"sanitize", "block"}:
+                    notice = self._guardian_notice(
+                        final_guardian_action,
+                        "planner final answer",
+                        final_guardian_reason,
+                    )
+                    history.append({"source": "Guardian", "content": notice})
+                    if self.verbose:
+                        print(f"  [Guardian]: {notice}")
+                    if final_guardian_action == "block":
+                        final_answer = _SUSPENDED_BY_GUARDIAN
+                        break
+                fa = self._extract_final_answer(planner_text)
             planner_result_directive = self._monitor_behavior(
                 source_agent=self._planner_name,
                 target="MASTeam",
@@ -788,7 +1264,7 @@ class MASTeam:
                 gate="PlannerResult",
             )
             if planner_result_directive:
-                final_answer = "Execution suspended by Sentinel"
+                final_answer = _SUSPENDED_BY_SENTINEL
                 blocked_text = (
                     f"[Sentinel blocked {self._planner_name}: "
                     f"{planner_result_directive.get('reason', 'execution suspended')}]"
@@ -883,12 +1359,35 @@ class MASTeam:
                             print(f"    [Sentinel]: {blocked_text}")
                         continue
 
+                    worker_results = self._sanitize_context(
+                        worker_results,
+                        label="worker_prompt_results",
+                    )
+                    history = self._sanitize_context(history, label="worker_prompt_history")
                     worker_prompt = self._build_worker_prompt(task, step_desc, worker_results)
                     t0 = time.time()
                     worker_text, worker_resp = await self._invoke_agent(worker_name, worker_prompt, timeout=wk_timeout)
                     collector.record_agent_call(
                         worker_name, worker_resp, time.time() - t0, is_planner=False
                     )
+                    worker_text, output_action, output_reason = self._guardian_review_output(
+                        worker_name,
+                        self._planner_name,
+                        worker_text,
+                        phase=f"worker result from {worker_name}",
+                    )
+                    if output_action in {"sanitize", "block"}:
+                        notice = self._guardian_notice(
+                            output_action,
+                            f"worker result from {worker_name}",
+                            output_reason,
+                        )
+                        history.append({"source": "Guardian", "content": notice})
+                        if self.verbose:
+                            print(f"    [Guardian]: {notice}")
+                        if output_action == "block":
+                            worker_results.append((worker_name, worker_text))
+                            continue
                     result_directive = self._monitor_behavior(
                         source_agent=worker_name,
                         target=self._planner_name,
@@ -962,12 +1461,22 @@ class MASTeam:
                                 f"{directive.get('reason', 'execution suspended')}]"
                             )
                             return wname, text, None, 0.0
-                        prompt = self._build_worker_prompt(task, desc, worker_results)
+                        prompt_results = self._sanitize_context(
+                            list(worker_results),
+                            label="parallel_worker_prompt_results",
+                        )
+                        prompt = self._build_worker_prompt(task, desc, prompt_results)
                         t0 = time.time()
                         text, resp = await self._invoke_agent(wname, prompt, timeout=wk_timeout)
                         elapsed_s = time.time() - t0
                         if resp is not None:
                             collector.record_agent_call(wname, resp, elapsed_s, is_planner=False)
+                        text, _output_action, _output_reason = self._guardian_review_output(
+                            wname,
+                            self._planner_name,
+                            text,
+                            phase=f"worker result from {wname}",
+                        )
                         return wname, text, None, elapsed_s
 
                     tasks_list = [_run_step(d, w) for d, w in group]
@@ -1015,6 +1524,11 @@ class MASTeam:
                         )
 
             # ========== 4. Planner 审查结果 ==========
+            history = self._sanitize_context(history, label="planner_review_history")
+            worker_results = self._sanitize_context(
+                worker_results,
+                label="planner_review_worker_results",
+            )
             review_prompt = self._build_planner_review_prompt(task, last_plan_text, worker_results)
             planner_directive = self._monitor_behavior(
                 source_agent=self._planner_name,
@@ -1029,7 +1543,7 @@ class MASTeam:
                 gate="PlannerDispatch",
             )
             if planner_directive:
-                final_answer = "Execution suspended by Sentinel"
+                final_answer = _SUSPENDED_BY_SENTINEL
                 blocked_text = (
                     f"[Sentinel blocked {self._planner_name}: "
                     f"{planner_directive.get('reason', 'execution suspended')}]"
@@ -1045,6 +1559,24 @@ class MASTeam:
             )
             planner_rounds += 1
             self._active_planner_rounds = planner_rounds
+            planner_review, review_guardian_action, review_guardian_reason, _review_guardian_rules = self._guardian_gate(
+                "output",
+                planner_review,
+                source_agent=self._planner_name,
+                target="User",
+            )
+            if review_guardian_action in {"sanitize", "block"}:
+                notice = self._guardian_notice(
+                    review_guardian_action,
+                    "planner review output",
+                    review_guardian_reason,
+                )
+                history.append({"source": "Guardian", "content": notice})
+                if self.verbose:
+                    print(f"  [Guardian]: {notice}")
+                if review_guardian_action == "block":
+                    final_answer = _SUSPENDED_BY_GUARDIAN
+                    break
             review_answer = self._extract_final_answer(planner_review)
             review_result_directive = self._monitor_behavior(
                 source_agent=self._planner_name,
@@ -1058,7 +1590,7 @@ class MASTeam:
                 gate="PlannerResult",
             )
             if review_result_directive:
-                final_answer = "Execution suspended by Sentinel"
+                final_answer = _SUSPENDED_BY_SENTINEL
                 blocked_text = (
                     f"[Sentinel blocked {self._planner_name}: "
                     f"{review_result_directive.get('reason', 'execution suspended')}]"
@@ -1085,6 +1617,7 @@ class MASTeam:
 
         # ========== 5. 兜底: 强制要求 FINAL_ANSWER ==========
         if not final_answer:
+            history = self._sanitize_context(history, label="forced_answer_history")
             recent_context = "\n".join(
                 f"[{m['source']}]: {m['content'][:400]}" for m in history[-6:]
             )
@@ -1110,7 +1643,7 @@ class MASTeam:
                     f"{planner_directive.get('reason', 'execution suspended')}]"
                 )
                 history.append({"source": "Sentinel", "content": forced})
-                final_answer = "Execution suspended by Sentinel"
+                final_answer = _SUSPENDED_BY_SENTINEL
             else:
                 t0 = time.time()
                 forced, forced_resp = await self._invoke_agent(self._planner_name, force_prompt, timeout=60)
@@ -1119,27 +1652,46 @@ class MASTeam:
                 )
                 planner_rounds += 1
                 self._active_planner_rounds = planner_rounds
-                forced_answer = self._extract_final_answer(forced)
-                forced_result_directive = self._monitor_behavior(
-                    source_agent=self._planner_name,
-                    target="User",
-                    behavior_type="final_answer",
-                    params={
-                        "content_preview": self._trim_text(forced, 320),
-                        "phase": "forced_answer",
-                    },
-                    gate="PlannerResult",
+                forced, forced_guardian_action, forced_guardian_reason = self._guardian_review_output(
+                    self._planner_name,
+                    "User",
+                    forced,
+                    phase="forced final answer",
                 )
-                if forced_result_directive:
-                    forced = (
-                        f"[Sentinel blocked {self._planner_name}: "
-                        f"{forced_result_directive.get('reason', 'execution suspended')}]"
+                if forced_guardian_action in {"sanitize", "block"}:
+                    notice = self._guardian_notice(
+                        forced_guardian_action,
+                        "forced final answer",
+                        forced_guardian_reason,
                     )
-                    history.append({"source": "Sentinel", "content": forced})
-                    final_answer = "Execution suspended by Sentinel"
-                else:
-                    history.append({"source": self._planner_name, "content": forced})
-                    final_answer = forced_answer
+                    history.append({"source": "Guardian", "content": notice})
+                    if self.verbose:
+                        print(f"  [Guardian]: {notice}")
+                    if forced_guardian_action == "block":
+                        final_answer = _SUSPENDED_BY_GUARDIAN
+                        forced = notice
+                if not final_answer:
+                    forced_answer = self._extract_final_answer(forced)
+                    forced_result_directive = self._monitor_behavior(
+                        source_agent=self._planner_name,
+                        target="User",
+                        behavior_type="final_answer",
+                        params={
+                            "content_preview": self._trim_text(forced, 320),
+                            "phase": "forced_answer",
+                        },
+                        gate="PlannerResult",
+                    )
+                    if forced_result_directive:
+                        forced = (
+                            f"[Sentinel blocked {self._planner_name}: "
+                            f"{forced_result_directive.get('reason', 'execution suspended')}]"
+                        )
+                        history.append({"source": "Sentinel", "content": forced})
+                        final_answer = _SUSPENDED_BY_SENTINEL
+                    else:
+                        history.append({"source": self._planner_name, "content": forced})
+                        final_answer = forced_answer
 
             if self.verbose:
                 preview = forced[:300].replace("\n", " ")
@@ -1180,6 +1732,7 @@ class MASTeam:
             "elapsed": round(elapsed, 1),
             "metrics": metrics,
             "sentinel_status": getattr(getattr(self, "sentinel", None), "status", None),
+            "response_cache": self.response_cache.stats(),
         }
 
     # --------------------------------------------------------

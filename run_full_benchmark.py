@@ -32,10 +32,12 @@
 import warnings
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
-import sys, io, os
-if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+import os
+import sys
+
+from mas.compat import ensure_utf8_stdio
+
+ensure_utf8_stdio()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -44,7 +46,7 @@ import asyncio
 import json
 import time
 from typing import List, Dict, Optional, Any, Set
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict
 
 from gaia_solver.config import get_text_client, API_KEY, MODEL_NAME, BASE_URL
@@ -170,6 +172,16 @@ def metrics_to_result_fields(metrics: Optional[TaskMetrics], *, tamas: bool = Fa
     }
 
 
+def tamas_tool_count(row: Dict[str, Any]) -> int:
+    count = int(row.get("total_tool_calls") or 0)
+    if count:
+        return count
+    tools = row.get("tools_called") or []
+    if isinstance(tools, list):
+        return len(tools)
+    return 0
+
+
 def defense_mode_name(use_guardian: bool, use_sentinel: bool) -> str:
     if use_guardian and use_sentinel:
         return "Guardian+Sentinel"
@@ -178,6 +190,49 @@ def defense_mode_name(use_guardian: bool, use_sentinel: bool) -> str:
     if use_guardian:
         return "Guardian-only"
     return "Baseline"
+
+
+def sentinel_result_fields(status: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Flatten Sentinel dynamic-response telemetry into benchmark rows."""
+    if not isinstance(status, dict) or not status:
+        return {}
+    control_plane = status.get("control_plane") or {}
+    baseline_profile = status.get("baseline_profile") or {}
+    recent_plans = control_plane.get("recent_remediation_plans") or []
+    return {
+        "sentinel_baseline_events": int(baseline_profile.get("normal_events", 0) or 0),
+        "sentinel_dynamic_mitigations": int(control_plane.get("dynamic_mitigation_count", 0) or 0),
+        "sentinel_recovered_mitigations": int(control_plane.get("recovered_mitigation_count", 0) or 0),
+        "sentinel_quarantined_content": int(control_plane.get("quarantined_content_count", 0) or 0),
+        "sentinel_context_sanitizations": int(control_plane.get("context_sanitization_count", 0) or 0),
+        "sentinel_runtime_judge_blocks": int(control_plane.get("runtime_judge_block_count", 0) or 0),
+        "sentinel_runtime_judge_ask_user": int(
+            (control_plane.get("runtime_judge_decision_counts") or {}).get("ask_user", 0) or 0
+        ),
+        "sentinel_runtime_judge_stop": int(
+            (control_plane.get("runtime_judge_decision_counts") or {}).get("stop", 0) or 0
+        ),
+        "sentinel_active_capability_cost": float(control_plane.get("active_capability_cost", 0.0) or 0.0),
+        "sentinel_temporary_capability_cost": float(control_plane.get("temporary_capability_cost", 0.0) or 0.0),
+        "sentinel_remediation_plans": len(recent_plans),
+        "sentinel_blocked_domains": sum(
+            len(values) for values in (control_plane.get("task_scoped_blocked_domains") or {}).values()
+        ) + len(control_plane.get("blocked_domains") or []),
+        "sentinel_blocked_sources": sum(
+            len(values) for values in (control_plane.get("task_scoped_blocked_sources") or {}).values()
+        ) + len(control_plane.get("blocked_sources") or []),
+    }
+
+
+def response_cache_result_fields(stats: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(stats, dict) or not stats:
+        return {}
+    return {
+        "response_cache_enabled": bool(stats.get("enabled", False)),
+        "response_cache_hits": int(stats.get("hits", 0) or 0),
+        "response_cache_misses": int(stats.get("misses", 0) or 0),
+        "response_cache_writes": int(stats.get("writes", 0) or 0),
+    }
 
 
 # ============================================================
@@ -273,6 +328,8 @@ async def run_gaia_single(
         "use_sentinel": use_sentinel,
         "defense_mode": defense_mode_name(use_guardian, use_sentinel),
         "sentinel_status": result.get("sentinel_status", {}) if 'result' in locals() else {},
+        **sentinel_result_fields(result.get("sentinel_status", {}) if 'result' in locals() else {}),
+        **response_cache_result_fields(result.get("response_cache", {}) if 'result' in locals() else {}),
         **metrics_dict,
     }
 
@@ -403,6 +460,10 @@ async def run_tamas_single(
         mode=mode,
         injected_query=task_info["attack_query"] if mode == "attack" else "",
     )
+    if not metrics_dict.get("total_tool_calls") and eval_result.get("tools_called"):
+        tool_counts = Counter(eval_result.get("tools_called") or [])
+        metrics_dict["tool_calls_detail"] = dict(tool_counts)
+        metrics_dict["total_tool_calls"] = sum(tool_counts.values())
 
     result_dict = {
         "id": task_id,
@@ -423,6 +484,8 @@ async def run_tamas_single(
         "use_sentinel": use_sentinel,
         "defense_mode": defense_mode_name(use_guardian, use_sentinel),
         "sentinel_status": result.get("sentinel_status", {}) if 'result' in locals() else {},
+        **sentinel_result_fields(result.get("sentinel_status", {}) if 'result' in locals() else {}),
+        **response_cache_result_fields(result.get("response_cache", {}) if 'result' in locals() else {}),
         **metrics_dict,
     }
 
@@ -582,6 +645,13 @@ def print_gaia_report():
         avg_tokens = sum(r.get("total_tokens", 0) for r in results) / total
         avg_tools = sum(r.get("total_tool_calls", 0) for r in results) / total
         total_tokens = sum(r.get("total_tokens", 0) for r in results)
+        max_capability_cost = max((float(r.get("sentinel_active_capability_cost", 0.0) or 0.0) for r in results), default=0.0)
+        total_quarantined = sum(int(r.get("sentinel_quarantined_content", 0) or 0) for r in results)
+        total_context_sanitized = sum(int(r.get("sentinel_context_sanitizations", 0) or 0) for r in results)
+        total_recovered = sum(int(r.get("sentinel_recovered_mitigations", 0) or 0) for r in results)
+        runtime_judge_blocks = sum(int(r.get("sentinel_runtime_judge_blocks", 0) or 0) for r in results)
+        cache_hits = sum(int(r.get("response_cache_hits", 0) or 0) for r in results)
+        cache_writes = sum(int(r.get("response_cache_writes", 0) or 0) for r in results)
 
         print(f"\n  [{label}] ({path})")
         print(f"    总题数:     {total}")
@@ -592,6 +662,15 @@ def print_gaia_report():
         print(f"    平均Token:  {avg_tokens:.0f}")
         print(f"    总Token:    {total_tokens}")
         print(f"    平均工具:   {avg_tools:.1f}")
+
+        if any(r.get("use_sentinel") for r in results):
+            print(
+                f"    Sentinel:    max capability cost={max_capability_cost:.3f}, "
+                f"quarantined={total_quarantined}, context_sanitized={total_context_sanitized}, "
+                f"recovered={total_recovered}, runtime_judge_blocks={runtime_judge_blocks}"
+            )
+        if cache_hits or cache_writes:
+            print(f"    Cache:       hits={cache_hits}, writes={cache_writes}")
 
         datasets.append({"label": label, "results": results})
 
@@ -642,7 +721,7 @@ def print_tamas_report():
             c_score = sum(r["score"] for r in clean) / len(clean)
             c_time = sum(r.get("elapsed_time", 0) for r in clean) / len(clean)
             c_tok = sum(r.get("total_tokens", 0) for r in clean) / len(clean)
-            c_tools = sum(r.get("total_tool_calls", 0) for r in clean) / len(clean)
+            c_tools = sum(tamas_tool_count(r) for r in clean) / len(clean)
             print(f"    [CLEAN]  完成: {c_done}/{len(clean)} ({c_done/len(clean)*100:.1f}%)")
             print(f"             Avg Score: {c_score:.3f}  Avg Time: {c_time:.1f}s  Avg Token: {c_tok:.0f}  Avg Tools: {c_tools:.1f}")
 
@@ -652,7 +731,7 @@ def print_tamas_report():
             a_score = sum(r["score"] for r in attack) / len(attack)
             a_time = sum(r.get("elapsed_time", 0) for r in attack) / len(attack)
             a_tok = sum(r.get("total_tokens", 0) for r in attack) / len(attack)
-            a_tools = sum(r.get("total_tool_calls", 0) for r in attack) / len(attack)
+            a_tools = sum(tamas_tool_count(r) for r in attack) / len(attack)
             print(f"    [ATTACK] 完成: {a_done}/{len(attack)} ({a_done/len(attack)*100:.1f}%)")
             print(f"             抵抗: {a_resist}/{len(attack)} ({a_resist/len(attack)*100:.1f}%)")
             print(f"             Avg Score: {a_score:.3f}  Avg Time: {a_time:.1f}s  Avg Token: {a_tok:.0f}  Avg Tools: {a_tools:.1f}")
@@ -680,6 +759,24 @@ def print_tamas_report():
                 avg_tok = sum(r.get("total_tokens", 0) for r in rs) / len(rs)
                 aria4 = sum(1 for r in rs if r["aria_score"] == "ARIA_4")
                 print(f"    {at:<16} {resist}/{len(rs):>8} {avg_s:>10.3f} {avg_t:>10.1f}s {avg_tok:>10.0f} {aria4:>8}")
+
+        if any(r.get("use_sentinel") for r in results):
+            max_capability_cost = max((float(r.get("sentinel_active_capability_cost", 0.0) or 0.0) for r in results), default=0.0)
+            total_quarantined = sum(int(r.get("sentinel_quarantined_content", 0) or 0) for r in results)
+            total_context_sanitized = sum(int(r.get("sentinel_context_sanitizations", 0) or 0) for r in results)
+            total_recovered = sum(int(r.get("sentinel_recovered_mitigations", 0) or 0) for r in results)
+            total_domains = sum(int(r.get("sentinel_blocked_domains", 0) or 0) for r in results)
+            runtime_judge_blocks = sum(int(r.get("sentinel_runtime_judge_blocks", 0) or 0) for r in results)
+            cache_hits = sum(int(r.get("response_cache_hits", 0) or 0) for r in results)
+            cache_writes = sum(int(r.get("response_cache_writes", 0) or 0) for r in results)
+            print(
+                f"    [Sentinel] max capability cost={max_capability_cost:.3f}, "
+                f"quarantined={total_quarantined}, context_sanitized={total_context_sanitized}, "
+                f"recovered={total_recovered}, "
+                f"blocked_domains={total_domains}, runtime_judge_blocks={runtime_judge_blocks}"
+            )
+            if cache_hits or cache_writes:
+                print(f"    [Cache] hits={cache_hits}, writes={cache_writes}")
 
         datasets.append({"label": label, "clean": clean, "attack": attack})
 
@@ -755,11 +852,22 @@ async def main_async(args):
         print_full_report()
         return
 
+    if args.response_cache:
+        os.environ["MAS_RESPONSE_CACHE"] = "1"
+    if args.response_cache_path:
+        os.environ["MAS_RESPONSE_CACHE_PATH"] = args.response_cache_path
+    if args.response_cache_namespace:
+        os.environ["MAS_RESPONSE_CACHE_NAMESPACE"] = args.response_cache_namespace
+    if args.response_cache_refresh:
+        os.environ["MAS_RESPONSE_CACHE_REFRESH"] = "1"
+
     print(f"\n{'#'*70}")
     print(f"  MAS Full Benchmark")
     print(f"  Model: {MODEL_NAME}")
     print(f"  API:   {BASE_URL}")
     print(f"  Date:  {time.strftime('%Y-%m-%d %H:%M')}")
+    if os.getenv("MAS_RESPONSE_CACHE", "").lower() in {"1", "true", "yes", "on", "enabled"}:
+        print(f"  Cache: enabled ({os.getenv('MAS_RESPONSE_CACHE_PATH', '.mas_response_cache.jsonl')})")
     print(f"{'#'*70}")
 
     # ---- GAIA 测试 ----
@@ -899,6 +1007,14 @@ def main():
                         help="Minimum repeated events for long-horizon Sentinel scoring")
     parser.add_argument("--sentinel-global-realtime", action="store_true",
                         help="Use global Sentinel realtime windows instead of task-scoped isolation")
+    parser.add_argument("--response-cache", action="store_true",
+                        help="Enable local exact-response cache for repeated agent prompts")
+    parser.add_argument("--response-cache-path", default=".mas_response_cache.jsonl",
+                        help="Path for MAS response cache JSONL")
+    parser.add_argument("--response-cache-namespace", default="benchmark",
+                        help="Namespace inside the response cache file")
+    parser.add_argument("--response-cache-refresh", action="store_true",
+                        help="Bypass cache reads but write fresh responses")
     parser.add_argument("--quiet", action="store_true", help="安静模式")
     parser.add_argument("--report-only", action="store_true", help="只输出已有结果的对比报告")
 

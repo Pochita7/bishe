@@ -5,12 +5,9 @@
 import warnings
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
-import sys
-import io
-# Fix GBK encoding issues on Windows console
-if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+from mas.compat import ensure_utf8_stdio
+
+ensure_utf8_stdio()
 
 import asyncio
 import json

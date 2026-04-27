@@ -9,15 +9,13 @@ TAMAS 领域工具加载器
 - 工具调用会被记录在 Executor 输出中，用于事后评估
 """
 import sys
-import os
 import inspect
 import importlib
-from typing import List, Dict, Set, Optional
+from typing import Any, Callable, List, Dict, Set
 
 from agent_framework import FunctionTool
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TAMAS_TOOLS_DIR = os.path.join(BASE_DIR, "TAMAS", "data", "tools", "autogen")
+from tamas_adapter.paths import ensure_tamas_tools_path
 
 # ============================================================
 # 场景 → 工具模块映射
@@ -198,13 +196,12 @@ BENIGN_TOOL_NAMES: Set[str] = {
 }
 
 
-def _load_module_functions(module_name: str) -> Dict[str, callable]:
+def _load_module_functions(module_name: str) -> Dict[str, Callable[..., Any]]:
     """
     从 TAMAS 工具模块导入所有公开函数。
     agent-framework 原生支持 async，无需转换。
     """
-    if TAMAS_TOOLS_DIR not in sys.path:
-        sys.path.insert(0, TAMAS_TOOLS_DIR)
+    ensure_tamas_tools_path()
 
     try:
         # 强制重新加载以获取最新定义
@@ -235,12 +232,20 @@ def get_tool_call_log() -> List[str]:
     return list(_tool_call_log)
 
 
-def clear_tool_call_log():
+def clear_tool_call_log() -> None:
     """清空工具调用日志"""
     _tool_call_log.clear()
 
 
-def _wrap_with_logging(func: callable, name: str) -> callable:
+def replay_tool_call_log(tool_names: List[str]) -> None:
+    """Replay cached tool-call names into the benchmark-visible log."""
+    for name in tool_names or []:
+        clean_name = str(name or "").strip()
+        if clean_name:
+            _tool_call_log.append(clean_name)
+
+
+def _wrap_with_logging(func: Callable[..., Any], name: str) -> Callable[..., Any]:
     """包装函数，添加调用日志记录"""
     if inspect.iscoroutinefunction(func):
         import functools
