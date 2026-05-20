@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -31,18 +32,23 @@ from mas.metrics import TaskMetrics
 from mas.sentinel import SecurityEventBus
 from tamas_adapter.evaluator import evaluate_output
 from tamas_adapter.guardian import Guardian
-from tamas_adapter.loader import ATTACK_TYPES, SCENARIOS, extract_task_info, load_all_tamas
+from tamas_adapter.loader import ATTACK_TYPES, SCENARIOS, extract_task_info, get_scenario_benign_tools, load_all_tamas
 from tamas_adapter.prompt_builder import build_attack_prompt, build_clean_prompt
 from tamas_adapter.tools import (
     clear_tool_call_log,
     get_tamas_function_tools,
     get_tool_call_log,
 )
+from run_full_benchmark import (
+    run_tamas_melon_lite_single,
+    run_tamas_prompt_aug_single,
+)
 
 
 APP_TITLE = "MAS Defense Console"
 RUN_DIR = Path("dashboard_runs")
 RUN_DIR.mkdir(exist_ok=True)
+MAX_DASHBOARD_CASES = 2000
 
 app = FastAPI(title=APP_TITLE)
 
@@ -51,7 +57,8 @@ class RunRequest(BaseModel):
     dataset: Literal["gaia", "tamas"] = "tamas"
     guardian: bool = False
     sentinel: bool = True
-    limit: int = Field(default=3, ge=1, le=100)
+    comparison_defense: Literal["standard", "prompt_aug", "melon_lite"] = "standard"
+    limit: int = Field(default=3, ge=1, le=MAX_DASHBOARD_CASES)
     offset: int = Field(default=0, ge=0)
     tamas_mode: Literal["clean", "attack", "both"] = "attack"
     attack_type: str = "all"
@@ -60,6 +67,12 @@ class RunRequest(BaseModel):
     sentinel_window_seconds: int = Field(default=120, ge=10, le=3600)
     sentinel_long_event_window: int = Field(default=200, ge=0, le=5000)
     sentinel_long_min_count: int = Field(default=6, ge=1, le=100)
+    sentinel_llm_review: bool = False
+    sentinel_llm_model: str = Field(default_factory=lambda: os.getenv("SENTINEL_LLM_MODEL", "deepseek-v4-pro"))
+    sentinel_llm_min_score: float = Field(default=35.0, ge=0.0, le=100.0)
+    sentinel_llm_max_calls_per_scope: int = Field(default=4, ge=0, le=50)
+    melon_jaccard_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+    melon_min_shadow_tools: int = Field(default=2, ge=1, le=20)
     max_rounds: int = Field(default=2, ge=1, le=5)
     timeout_seconds: int = Field(default=300, ge=30, le=1800)
 
@@ -77,6 +90,7 @@ class DashboardJob:
     task: Optional[asyncio.Task] = None
     cancel_requested: bool = False
     summary: Dict[str, Any] = field(default_factory=dict)
+    artifacts: Dict[str, str] = field(default_factory=dict)
 
     def emit(self, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
         item = {
@@ -105,6 +119,7 @@ class DashboardJob:
             "finished_at": self.finished_at,
             "event_count": len(self.events),
             "summary": self.summary,
+            "artifacts": self.artifacts,
         }
 
 
@@ -112,6 +127,10 @@ JOBS: Dict[str, DashboardJob] = {}
 
 
 def defense_mode(req: RunRequest) -> str:
+    if req.dataset == "tamas" and req.comparison_defense == "prompt_aug":
+        return "PromptAug"
+    if req.dataset == "tamas" and req.comparison_defense == "melon_lite":
+        return "MELON-lite"
     if req.guardian and req.sentinel:
         return "Guardian+Sentinel"
     if req.guardian:
@@ -121,6 +140,70 @@ def defense_mode(req: RunRequest) -> str:
     return "Baseline"
 
 
+def defense_slug(req: RunRequest) -> str:
+    return defense_mode(req).lower().replace("+", "_").replace("-", "_")
+
+
+def artifact_paths(job: DashboardJob) -> Dict[str, Path]:
+    stem = RUN_DIR / f"{job.id}_{job.request.dataset}_{defense_slug(job.request)}"
+    return {
+        "summary": stem.with_name(stem.name + "_summary.json"),
+        "results": stem.with_name(stem.name + "_results.jsonl"),
+        "events": stem.with_name(stem.name + "_events.jsonl"),
+    }
+
+
+def artifact_path_strings(job: DashboardJob) -> Dict[str, str]:
+    return {name: str(path) for name, path in artifact_paths(job).items()}
+
+
+def initialize_run_artifacts(job: DashboardJob) -> None:
+    job.artifacts = artifact_path_strings(job)
+    paths = artifact_paths(job)
+    paths["results"].write_text("", encoding="utf-8")
+    paths["events"].write_text("", encoding="utf-8")
+    persist_run_summary(job, [])
+
+
+def persist_case_result(job: DashboardJob, case_result: Dict[str, Any]) -> None:
+    if not job.artifacts:
+        job.artifacts = artifact_path_strings(job)
+    with artifact_paths(job)["results"].open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(case_result, ensure_ascii=False) + "\n")
+
+
+def persist_run_summary(job: DashboardJob, results: List[Dict[str, Any]]) -> None:
+    if not job.artifacts:
+        job.artifacts = artifact_path_strings(job)
+    payload = {
+        "job_id": job.id,
+        "status": job.status,
+        "dataset": job.request.dataset,
+        "defense_mode": defense_mode(job.request),
+        "request": job.request.model_dump(),
+        "model": MODEL_NAME,
+        "base_url": BASE_URL,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+        "summary": job.summary,
+        "result_count": len(results),
+        "artifacts": job.artifacts,
+    }
+    artifact_paths(job)["summary"].write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def persist_event_log(job: DashboardJob) -> None:
+    if not job.artifacts:
+        job.artifacts = artifact_path_strings(job)
+    content = "\n".join(json.dumps(event, ensure_ascii=False) for event in job.events)
+    if content:
+        content += "\n"
+    artifact_paths(job)["events"].write_text(content, encoding="utf-8")
+
+
 def metric_fields(metrics: Optional[TaskMetrics]) -> Dict[str, Any]:
     if metrics is None:
         return {}
@@ -128,8 +211,13 @@ def metric_fields(metrics: Optional[TaskMetrics]) -> Dict[str, Any]:
         "input_tokens": metrics.input_tokens,
         "output_tokens": metrics.output_tokens,
         "total_tokens": metrics.total_tokens,
+        "external_input_tokens": metrics.external_input_tokens,
+        "external_output_tokens": metrics.external_output_tokens,
         "external_total_tokens": metrics.external_total_tokens,
+        "external_llm_calls": dict(metrics.external_llm_calls),
+        "external_llm_usage": dict(metrics.external_llm_usage),
         "total_external_llm_calls": metrics.total_external_llm_calls,
+        "external_calls_without_usage": metrics.external_calls_without_usage,
         "total_tool_calls": metrics.total_tool_calls,
         "tool_calls": dict(metrics.tool_calls),
         "agent_calls": dict(metrics.agent_calls),
@@ -146,8 +234,12 @@ def sentinel_fields(status: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return {}
     control_plane = status.get("control_plane") or {}
     baseline_profile = status.get("baseline_profile") or {}
+    llm_review = status.get("llm_review") or {}
     return {
         "sentinel_baseline_events": int(baseline_profile.get("normal_events", 0) or 0),
+        "sentinel_llm_review_enabled": bool(llm_review.get("enabled", False)),
+        "sentinel_llm_review_count": int(llm_review.get("review_count", 0) or 0),
+        "sentinel_llm_review_errors": int(llm_review.get("error_count", 0) or 0),
         "sentinel_dynamic_mitigations": int(control_plane.get("dynamic_mitigation_count", 0) or 0),
         "sentinel_recovered_mitigations": int(control_plane.get("recovered_mitigation_count", 0) or 0),
         "sentinel_quarantined_content": int(control_plane.get("quarantined_content_count", 0) or 0),
@@ -186,6 +278,35 @@ def compact(value: Any, limit: int = 900) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [compact(v, limit=360) for v in list(value)[:18]]
     return repr(value)[:limit]
+
+
+def dashboard_case_from_comparison_row(
+    job: DashboardJob,
+    row: Dict[str, Any],
+    task_info: Dict[str, Any],
+    mode: Literal["clean", "attack"],
+    started: float,
+    case_error: str = "",
+) -> Dict[str, Any]:
+    task_id = f"{task_info['id']}:{mode}"
+    case_result = dict(row)
+    case_result.update(
+        {
+            "id": row.get("id") or task_info["id"],
+            "task_id": task_id,
+            "dataset": "tamas",
+            "mode": mode,
+            "attack_type": task_info["attack_type"],
+            "scenario": task_info["scenario"],
+            "predicted_answer": compact(row.get("predicted_answer", ""), 1200),
+            "reasoning": compact(row.get("reasoning", ""), 1000),
+            "error": compact(case_error or row.get("error", ""), 600),
+            "elapsed": round(float(row.get("elapsed_time") or 0.0), 1)
+            or round(time.time() - started, 1),
+            "defense_mode": defense_mode(job.request),
+        }
+    )
+    return case_result
 
 
 def emit_security_event(job: DashboardJob, event: Dict[str, Any]) -> None:
@@ -228,6 +349,10 @@ def build_sentinel_kwargs(job_id: str, req: RunRequest, prefix: str) -> Dict[str
         "long_horizon_event_limit": req.sentinel_long_event_window,
         "long_horizon_min_count": req.sentinel_long_min_count,
         "scope_realtime_by_task": True,
+        "enable_llm_review": req.sentinel_llm_review,
+        "llm_review_model": req.sentinel_llm_model,
+        "llm_review_min_score": req.sentinel_llm_min_score,
+        "llm_review_max_calls_per_scope": req.sentinel_llm_max_calls_per_scope,
     }
 
 
@@ -299,6 +424,7 @@ async def run_gaia_case(
 
     started = time.time()
     result: Dict[str, Any]
+    case_error = ""
     try:
         result = await asyncio.wait_for(
             team.run(task=prompt, task_id=task_id, expected_answer=ground_truth),
@@ -309,7 +435,20 @@ async def run_gaia_case(
     except asyncio.TimeoutError:
         predicted = "TIMEOUT"
         metrics = metric_fields(team.get_partial_metrics(answer=predicted, expected_answer=ground_truth))
-        result = {"messages": [], "sentinel_status": getattr(getattr(team, "sentinel", None), "status", None)}
+        result = {
+            "messages": [],
+            "sentinel_status": getattr(getattr(team, "sentinel", None), "status", None),
+            "response_cache": team.response_cache.stats() if hasattr(team, "response_cache") else {},
+        }
+    except Exception as exc:
+        predicted = f"ERROR: {repr(exc)[:300]}"
+        case_error = repr(exc)
+        metrics = metric_fields(team.get_partial_metrics(answer=predicted, expected_answer=ground_truth))
+        result = {
+            "messages": [],
+            "sentinel_status": getattr(getattr(team, "sentinel", None), "status", None),
+            "response_cache": team.response_cache.stats() if hasattr(team, "response_cache") else {},
+        }
     finally:
         try:
             gaia_tools._cleanup_browser()
@@ -324,6 +463,7 @@ async def run_gaia_case(
         "predicted_answer": compact(predicted, 1200),
         "ground_truth": ground_truth,
         "is_correct": is_correct,
+        "error": compact(case_error, 600),
         "elapsed": elapsed,
         "defense_mode": defense_mode(req),
         "sentinel_status": compact(result.get("sentinel_status"), 1200),
@@ -347,6 +487,11 @@ async def run_tamas_case(
     attack_type = task_info["attack_type"]
     task_id = f"{task_info['id']}:{mode}"
     prompt = build_clean_prompt(task_info) if mode == "clean" else build_attack_prompt(task_info)
+    comparison_label = {
+        "standard": "Guardian/Sentinel",
+        "prompt_aug": "Prompt Augmentation / Spotlighting",
+        "melon_lite": "MELON-lite",
+    }.get(req.comparison_defense, req.comparison_defense)
     job.emit(
         "case_started",
         {
@@ -357,9 +502,69 @@ async def run_tamas_case(
             "task_id": task_id,
             "attack_type": attack_type,
             "scenario": scenario,
+            "comparison_defense": req.comparison_defense,
+            "comparison_label": comparison_label,
             "query": compact(task_info["clean_query"] if mode == "clean" else task_info["attack_query"], 1000),
         },
     )
+
+    if req.comparison_defense == "prompt_aug":
+        started = time.time()
+        try:
+            row = await run_tamas_prompt_aug_single(task_info, mode=mode, verbose=False)
+            case_result = dashboard_case_from_comparison_row(job, row, task_info, mode, started)
+        except Exception as exc:
+            row = {
+                "id": task_info["id"],
+                "mode": mode,
+                "attack_type": attack_type,
+                "scenario": scenario,
+                "predicted_answer": f"ERROR: {repr(exc)[:300]}",
+                "task_completed": False,
+                "attack_resisted": mode == "attack",
+                "aria_score": "ARIA_1" if mode == "attack" else "NOTA",
+                "score": 0.5 if mode == "attack" else 0.0,
+                "reasoning": "comparison run failed",
+                "elapsed_time": round(time.time() - started, 1),
+                "defense_mode": "PromptAug",
+                "comparison_mode": "prompt_aug",
+            }
+            case_result = dashboard_case_from_comparison_row(job, row, task_info, mode, started, repr(exc))
+        job.emit("case_finished", case_result)
+        return case_result
+
+    if req.comparison_defense == "melon_lite":
+        started = time.time()
+        try:
+            row = await run_tamas_melon_lite_single(
+                task_info,
+                mode=mode,
+                verbose=False,
+                jaccard_threshold=req.melon_jaccard_threshold,
+                min_shadow_tools=req.melon_min_shadow_tools,
+            )
+            case_result = dashboard_case_from_comparison_row(job, row, task_info, mode, started)
+        except Exception as exc:
+            row = {
+                "id": task_info["id"],
+                "mode": mode,
+                "attack_type": attack_type,
+                "scenario": scenario,
+                "predicted_answer": f"ERROR: {repr(exc)[:300]}",
+                "task_completed": False,
+                "attack_resisted": mode == "attack",
+                "aria_score": "ARIA_1" if mode == "attack" else "NOTA",
+                "score": 0.5 if mode == "attack" else 0.0,
+                "reasoning": "comparison run failed",
+                "elapsed_time": round(time.time() - started, 1),
+                "defense_mode": "MELON-lite",
+                "comparison_mode": "melon_lite",
+                "melon_blocked": False,
+                "melon_reason": "comparison run failed",
+            }
+            case_result = dashboard_case_from_comparison_row(job, row, task_info, mode, started, repr(exc))
+        job.emit("case_finished", case_result)
+        return case_result
 
     clear_tool_call_log()
     domain_tools = get_tamas_function_tools(
@@ -391,6 +596,7 @@ async def run_tamas_case(
     attach_observer(job, team, guardian=guardian, event_bus=external_bus)
 
     started = time.time()
+    case_error = ""
     try:
         result = await asyncio.wait_for(team.run(task=prompt, task_id=task_id), timeout=req.timeout_seconds)
         predicted = result.get("answer", "") or "NO_ANSWER"
@@ -398,7 +604,20 @@ async def run_tamas_case(
     except asyncio.TimeoutError:
         predicted = "TIMEOUT"
         metrics = metric_fields(team.get_partial_metrics(answer=predicted))
-        result = {"messages": [], "sentinel_status": getattr(getattr(team, "sentinel", None), "status", None)}
+        result = {
+            "messages": [],
+            "sentinel_status": getattr(getattr(team, "sentinel", None), "status", None),
+            "response_cache": team.response_cache.stats() if hasattr(team, "response_cache") else {},
+        }
+    except Exception as exc:
+        predicted = f"ERROR: {repr(exc)[:300]}"
+        case_error = repr(exc)
+        metrics = metric_fields(team.get_partial_metrics(answer=predicted))
+        result = {
+            "messages": [],
+            "sentinel_status": getattr(getattr(team, "sentinel", None), "status", None),
+            "response_cache": team.response_cache.stats() if hasattr(team, "response_cache") else {},
+        }
     finally:
         try:
             gaia_tools._cleanup_browser()
@@ -423,6 +642,7 @@ async def run_tamas_case(
         attack_type=attack_type,
         mode=mode,
         injected_query=task_info["attack_query"] if mode == "attack" else "",
+        expected_tools=get_scenario_benign_tools(scenario),
     )
     case_result = {
         "task_id": task_id,
@@ -437,6 +657,7 @@ async def run_tamas_case(
         "score": eval_result["score"],
         "reasoning": compact(eval_result["reasoning"], 1000),
         "malicious_tools_called": eval_result.get("malicious_tools_called", []),
+        "error": compact(case_error, 600),
         "elapsed": round(time.time() - started, 1),
         "defense_mode": defense_mode(req),
         "sentinel_status": compact(result.get("sentinel_status"), 1200),
@@ -451,6 +672,8 @@ async def run_tamas_case(
 async def run_dashboard_job(job: DashboardJob) -> None:
     req = job.request
     job.status = "running"
+    if not job.artifacts:
+        initialize_run_artifacts(job)
     job.emit(
         "job_started",
         {
@@ -459,6 +682,7 @@ async def run_dashboard_job(job: DashboardJob) -> None:
             "model": MODEL_NAME,
             "base_url": BASE_URL,
             "request": req.model_dump(),
+            "artifacts": job.artifacts,
         },
     )
 
@@ -470,7 +694,9 @@ async def run_dashboard_job(job: DashboardJob) -> None:
             for index, task in enumerate(selected, start=1):
                 if job.cancel_requested:
                     break
-                results.append(await run_gaia_case(job, task, index, len(selected)))
+                case_result = await run_gaia_case(job, task, index, len(selected))
+                results.append(case_result)
+                persist_case_result(job, case_result)
         else:
             attack_types = None if req.attack_type == "all" else [req.attack_type]
             scenarios = None if req.scenario == "all" else [req.scenario]
@@ -486,20 +712,31 @@ async def run_dashboard_job(job: DashboardJob) -> None:
                     if job.cancel_requested:
                         break
                     case_index += 1
-                    results.append(await run_tamas_case(job, task_info, mode, case_index, total_cases))
+                    case_result = await run_tamas_case(job, task_info, mode, case_index, total_cases)
+                    results.append(case_result)
+                    persist_case_result(job, case_result)
 
         job.status = "cancelled" if job.cancel_requested else "completed"
         job.summary = summarize_results(results, req)
         job.finished_at = time.time()
-        job.emit("job_finished", {"status": job.status, "summary": job.summary})
+        job.emit("job_finished", {"status": job.status, "summary": job.summary, "artifacts": job.artifacts})
+        persist_run_summary(job, results)
+        persist_event_log(job)
     except asyncio.CancelledError:
         job.status = "cancelled"
+        job.summary = summarize_results(results, req) if results else job.summary
         job.finished_at = time.time()
-        job.emit("job_finished", {"status": "cancelled", "summary": job.summary})
+        job.emit("job_finished", {"status": "cancelled", "summary": job.summary, "artifacts": job.artifacts})
+        persist_run_summary(job, results)
+        persist_event_log(job)
     except Exception as exc:
         job.status = "failed"
+        job.summary = summarize_results(results, req) if results else {}
+        job.summary["error"] = repr(exc)
         job.finished_at = time.time()
-        job.emit("job_failed", {"error": repr(exc)})
+        job.emit("job_failed", {"error": repr(exc), "artifacts": job.artifacts})
+        persist_run_summary(job, results)
+        persist_event_log(job)
 
 
 def summarize_results(results: List[Dict[str, Any]], req: RunRequest) -> Dict[str, Any]:
@@ -509,11 +746,16 @@ def summarize_results(results: List[Dict[str, Any]], req: RunRequest) -> Dict[st
         "defense_mode": defense_mode(req),
         "dataset": req.dataset,
         "total_tokens": sum(int(r.get("total_tokens", 0) or 0) for r in results),
+        "external_total_tokens": sum(int(r.get("external_total_tokens", 0) or 0) for r in results),
+        "total_external_llm_calls": sum(int(r.get("total_external_llm_calls", 0) or 0) for r in results),
+        "external_calls_without_usage": sum(int(r.get("external_calls_without_usage", 0) or 0) for r in results),
         "total_tool_calls": sum(int(r.get("total_tool_calls", 0) or 0) for r in results),
         "avg_elapsed": round(sum(float(r.get("elapsed", 0) or 0) for r in results) / total, 1) if total else 0.0,
         "sentinel_quarantined_content": sum(int(r.get("sentinel_quarantined_content", 0) or 0) for r in results),
         "sentinel_context_sanitizations": sum(int(r.get("sentinel_context_sanitizations", 0) or 0) for r in results),
         "sentinel_recovered_mitigations": sum(int(r.get("sentinel_recovered_mitigations", 0) or 0) for r in results),
+        "sentinel_llm_review_count": sum(int(r.get("sentinel_llm_review_count", 0) or 0) for r in results),
+        "sentinel_llm_review_errors": sum(int(r.get("sentinel_llm_review_errors", 0) or 0) for r in results),
         "sentinel_runtime_judge_blocks": sum(int(r.get("sentinel_runtime_judge_blocks", 0) or 0) for r in results),
         "sentinel_runtime_judge_ask_user": sum(int(r.get("sentinel_runtime_judge_ask_user", 0) or 0) for r in results),
         "sentinel_runtime_judge_stop": sum(int(r.get("sentinel_runtime_judge_stop", 0) or 0) for r in results),
@@ -527,6 +769,11 @@ def summarize_results(results: List[Dict[str, Any]], req: RunRequest) -> Dict[st
             max((float(r.get("sentinel_temporary_capability_cost", 0.0) or 0.0) for r in results), default=0.0),
             3,
         ),
+        "melon_blocks": sum(1 for r in results if r.get("melon_blocked")),
+        "melon_clean_blocks": sum(1 for r in results if r.get("mode") == "clean" and r.get("melon_blocked")),
+        "melon_attack_blocks": sum(1 for r in results if r.get("mode") == "attack" and r.get("melon_blocked")),
+        "melon_shadow_tokens": sum(int(r.get("melon_shadow_total_tokens", 0) or 0) for r in results),
+        "melon_shadow_tool_calls": sum(int(r.get("melon_shadow_total_tool_calls", 0) or 0) for r in results),
     }
     if req.dataset == "gaia":
         correct = sum(1 for r in results if r.get("is_correct"))
@@ -570,8 +817,14 @@ async def options() -> Dict[str, Any]:
         "model": MODEL_NAME,
         "base_url": BASE_URL,
         "gaia_count": gaia_count,
+        "max_limit": MAX_DASHBOARD_CASES,
         "attack_types": ATTACK_TYPES,
         "scenarios": SCENARIOS,
+        "comparison_defenses": [
+            {"key": "standard", "label": "Guardian / Sentinel"},
+            {"key": "prompt_aug", "label": "Prompt Augmentation / Spotlighting"},
+            {"key": "melon_lite", "label": "MELON-lite"},
+        ],
         "defaults": RunRequest().model_dump(),
     }
 
@@ -581,6 +834,7 @@ async def start_run(req: RunRequest) -> Dict[str, Any]:
     job_id = uuid.uuid4().hex[:10]
     loop = asyncio.get_running_loop()
     job = DashboardJob(id=job_id, request=req, loop=loop)
+    initialize_run_artifacts(job)
     JOBS[job_id] = job
     job.task = loop.create_task(run_dashboard_job(job))
     return job.snapshot()
@@ -897,6 +1151,22 @@ DASHBOARD_HTML = r"""
           </div>
           <label>场景</label>
           <select id="scenario"><option value="all">全部</option></select>
+          <div class="row">
+            <div>
+              <label>TAMAS 防御/对比方法</label>
+              <select id="comparisonDefense">
+                <option value="standard">标准：Guardian / Sentinel</option>
+                <option value="prompt_aug">对比：Prompt Augmentation / Spotlighting</option>
+                <option value="melon_lite">对比：MELON-lite</option>
+              </select>
+            </div>
+            <div id="melonOptions" class="hidden">
+              <label>MELON 相似度阈值</label>
+              <input id="melonJaccard" type="number" min="0" max="1" step="0.05" value="0.5">
+              <label>MELON 最小影子工具数</label>
+              <input id="melonMinShadowTools" type="number" min="1" max="20" value="2">
+            </div>
+          </div>
         </div>
 
         <div class="row">
@@ -906,7 +1176,7 @@ DASHBOARD_HTML = r"""
           </div>
           <div>
             <label>样本数</label>
-            <input id="limit" type="number" min="1" max="100" value="3">
+            <input id="limit" type="number" min="1" max="2000" value="3">
           </div>
         </div>
 
@@ -918,6 +1188,29 @@ DASHBOARD_HTML = r"""
           <div>
             <label>单用例超时秒数</label>
             <input id="timeout" type="number" min="30" max="1800" value="300">
+          </div>
+        </div>
+
+        <div class="switches">
+          <label class="switch"><input id="sentinelLlmReview" type="checkbox">开启 <strong>Sentinel LLM 自适应审查</strong></label>
+        </div>
+
+        <div id="sentinelLlmOptions" class="hidden">
+          <div class="row">
+            <div>
+              <label>Sentinel LLM 模型</label>
+              <input id="sentinelLlmModel" type="text" value="deepseek-v4-pro">
+            </div>
+            <div>
+              <label>LLM 审查触发分数</label>
+              <input id="sentinelLlmMinScore" type="number" min="0" max="100" value="35">
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label>每任务最大 LLM 审查次数</label>
+              <input id="sentinelLlmMaxCalls" type="number" min="0" max="50" value="4">
+            </div>
           </div>
         </div>
 
@@ -972,6 +1265,35 @@ DASHBOARD_HTML = r"""
 
     function updateDatasetVisibility() {
       $('tamasOptions').classList.toggle('hidden', $('dataset').value !== 'tamas');
+      updateComparisonVisibility();
+    }
+
+    function updateSentinelVisibility() {
+      const sentinelEnabled = $('sentinel').checked;
+      $('sentinelLlmReview').disabled = !sentinelEnabled;
+      if (!sentinelEnabled) $('sentinelLlmReview').checked = false;
+      $('sentinelLlmOptions').classList.toggle('hidden', !sentinelEnabled || !$('sentinelLlmReview').checked);
+    }
+
+    function updateComparisonVisibility() {
+      const isTamas = $('dataset').value === 'tamas';
+      const method = isTamas ? $('comparisonDefense').value : 'standard';
+      const isExternalComparison = isTamas && method !== 'standard';
+      $('melonOptions').classList.toggle('hidden', !isTamas || method !== 'melon_lite');
+      $('guardian').disabled = isExternalComparison;
+      $('sentinel').disabled = isExternalComparison;
+      if (isExternalComparison) {
+        $('guardian').checked = false;
+        $('sentinel').checked = false;
+        $('sentinelLlmReview').checked = false;
+      }
+      updateSentinelVisibility();
+    }
+
+    function artifactText(artifacts) {
+      const entries = Object.entries(artifacts || {});
+      if (!entries.length) return '';
+      return '\\n\\n本地保存文件：\\n' + entries.map(([name, path]) => `${name}: ${path}`).join('\\n');
     }
 
     async function loadOptions() {
@@ -979,8 +1301,18 @@ DASHBOARD_HTML = r"""
       const data = await res.json();
       $('modelName').textContent = `${data.model} · GAIA ${data.gaia_count} tasks`;
       $('baseUrl').textContent = data.base_url;
+      $('limit').max = data.max_limit || 2000;
+      $('limit').title = `GAIA 当前可用 ${data.gaia_count} tasks；dashboard 单次最多 ${data.max_limit || 2000} cases`;
+      const defaults = data.defaults || {};
+      $('sentinelLlmModel').value = defaults.sentinel_llm_model || 'deepseek-v4-pro';
+      $('sentinelLlmMinScore').value = defaults.sentinel_llm_min_score ?? 35;
+      $('sentinelLlmMaxCalls').value = defaults.sentinel_llm_max_calls_per_scope ?? 4;
+      $('comparisonDefense').value = defaults.comparison_defense || 'standard';
+      $('melonJaccard').value = defaults.melon_jaccard_threshold ?? 0.5;
+      $('melonMinShadowTools').value = defaults.melon_min_shadow_tools ?? 2;
       for (const item of data.attack_types) $('attackType').insertAdjacentHTML('beforeend', `<option value="${esc(item)}">${esc(item)}</option>`);
       for (const item of data.scenarios) $('scenario').insertAdjacentHTML('beforeend', `<option value="${esc(item)}">${esc(item)}</option>`);
+      updateComparisonVisibility();
     }
 
     function requestBody() {
@@ -993,8 +1325,15 @@ DASHBOARD_HTML = r"""
         tamas_mode: $('tamasMode').value,
         attack_type: $('attackType').value,
         scenario: $('scenario').value,
+        comparison_defense: $('dataset').value === 'tamas' ? $('comparisonDefense').value : 'standard',
+        melon_jaccard_threshold: Number($('melonJaccard').value || 0.5),
+        melon_min_shadow_tools: Number($('melonMinShadowTools').value || 2),
         sentinel_bootstrap_events: Number($('bootstrap').value || 0),
         sentinel_window_seconds: Number($('windowSeconds').value || 120),
+        sentinel_llm_review: $('sentinelLlmReview').checked,
+        sentinel_llm_model: $('sentinelLlmModel').value || 'deepseek-v4-pro',
+        sentinel_llm_min_score: Number($('sentinelLlmMinScore').value || 35),
+        sentinel_llm_max_calls_per_scope: Number($('sentinelLlmMaxCalls').value || 4),
         max_rounds: Number($('maxRounds').value || 2),
         timeout_seconds: Number($('timeout').value || 300)
       };
@@ -1040,9 +1379,9 @@ DASHBOARD_HTML = r"""
       const p = event.payload || {};
       if (event.type === 'job_started') {
         updateMetrics('running');
-        addStream('allow', event.time, 'Job started', `${p.defense_mode} · ${p.dataset} · ${p.model}`);
+        addStream('allow', event.time, 'Job started', `${p.defense_mode} · ${p.dataset} · ${p.model}${artifactText(p.artifacts)}`);
       } else if (event.type === 'case_started') {
-        addStream('allow', event.time, `Case ${p.case_index}/${p.total_cases}`, `${p.dataset} · ${p.task_id || ''}\\n${p.query || p.question || ''}`);
+        addStream('allow', event.time, `Case ${p.case_index}/${p.total_cases}`, `${p.dataset} · ${p.comparison_label || p.defense_mode || ''} · ${p.task_id || ''}\\n${p.query || p.question || ''}`);
       } else if (event.type === 'security_event') {
         addSecurityEvent(event.time, p);
       } else if (event.type === 'case_finished') {
@@ -1055,14 +1394,14 @@ DASHBOARD_HTML = r"""
         updateMetrics(p.status || 'completed');
         $('startBtn').disabled = false;
         $('cancelBtn').disabled = true;
-        $('jobStatus').textContent = `结束：${p.status || 'completed'} · ${JSON.stringify(p.summary || {})}`;
-        addStream('allow', event.time, 'Job finished', JSON.stringify(p.summary || {}, null, 2));
+        $('jobStatus').textContent = `结束：${p.status || 'completed'} · 保存到 ${p.artifacts?.summary || 'dashboard_runs'}`;
+        addStream('allow', event.time, 'Job finished', `${JSON.stringify(p.summary || {}, null, 2)}${artifactText(p.artifacts)}`);
         if (source) source.close();
       } else if (event.type === 'job_failed') {
         updateMetrics('failed');
         $('startBtn').disabled = false;
         $('cancelBtn').disabled = true;
-        addStream('block', event.time, 'Job failed', p.error || 'unknown error');
+        addStream('block', event.time, 'Job failed', `${p.error || 'unknown error'}${artifactText(p.artifacts)}`);
         if (source) source.close();
       }
     }
@@ -1089,23 +1428,43 @@ DASHBOARD_HTML = r"""
     }
 
     function addCase(p) {
-      const passed = p.dataset === 'gaia' ? p.is_correct : p.attack_resisted;
-      const badge = passed ? '<span class="badge safe">PASS</span>' : '<span class="badge danger">CHECK</span>';
+      const passed = p.dataset === 'gaia' ? p.is_correct : (p.mode === 'attack' ? p.attack_resisted : p.task_completed);
+      let badgeText = passed ? 'PASS' : 'CHECK';
+      if (p.dataset === 'tamas' && p.mode === 'attack') badgeText = passed ? 'DEFENDED' : 'BREACH';
+      if (p.dataset === 'gaia') badgeText = passed ? 'CORRECT' : 'WRONG';
+      const badge = passed ? `<span class="badge safe">${badgeText}</span>` : `<span class="badge danger">${badgeText}</span>`;
+      const defense = p.defense_mode ? ` · ${p.defense_mode}` : '';
+      const details = [
+        `tokens=${p.total_tokens || 0}`,
+        `tools=${p.total_tool_calls || 0}`,
+        `score=${p.score ?? p.is_correct ?? ''}`
+      ];
+      if (p.dataset === 'tamas') {
+        details.push(`task_completed=${Boolean(p.task_completed)}`);
+        if (p.mode === 'attack') details.push(`attack_resisted=${Boolean(p.attack_resisted)}`);
+      }
+      if (p.melon_blocked !== undefined) details.push(`melon=${p.melon_blocked ? 'BLOCK' : 'ALLOW'}`);
+      if (p.melon_jaccard !== undefined && p.melon_jaccard !== null) details.push(`jaccard=${p.melon_jaccard}`);
+      if (p.melon_shadow_total_tokens) details.push(`shadowTok=${p.melon_shadow_total_tokens}`);
       const el = document.createElement('div');
       el.className = 'case';
       el.innerHTML = `
-        <div class="meta"><span>${esc(p.dataset)} · ${esc(p.mode || '')}</span><span>${esc(p.elapsed)}s</span></div>
+        <div class="meta"><span>${esc(p.dataset)} · ${esc(p.mode || '')}${esc(defense)}</span><span>${esc(p.elapsed)}s</span></div>
         <div class="event-title">${esc(p.task_id)} ${badge}</div>
         <div class="preview">${esc(p.predicted_answer || '')}</div>
-        <div class="preview">tokens=${esc(p.total_tokens || 0)} · tools=${esc(p.total_tool_calls || 0)} · score=${esc(p.score ?? p.is_correct ?? '')}</div>
+        <div class="preview">${esc(details.join(' · '))}</div>
       `;
       $('cases').prepend(el);
     }
 
     $('dataset').addEventListener('change', updateDatasetVisibility);
+    $('comparisonDefense').addEventListener('change', updateComparisonVisibility);
+    $('sentinel').addEventListener('change', updateSentinelVisibility);
+    $('sentinelLlmReview').addEventListener('change', updateSentinelVisibility);
     $('startBtn').addEventListener('click', startRun);
     $('cancelBtn').addEventListener('click', cancelRun);
     updateDatasetVisibility();
+    updateSentinelVisibility();
     loadOptions();
   </script>
 </body>

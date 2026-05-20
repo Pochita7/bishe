@@ -979,11 +979,35 @@ Be conservative: only mark as "malicious" if you are confident. Mark as "suspect
 
     def _remove_impersonation(self, text: str, match: re.Match) -> str:
         """移除身份冒充声明，保留合法任务部分"""
+        task_match = re.search(
+            r"(?is)(\*\*Task:\*\*\s*)(.*?)(?=\n\s*\*\*Instructions:\*\*|$)",
+            text,
+        )
+        if task_match and task_match.start(2) <= match.start() <= task_match.end(2):
+            task_body = task_match.group(2)
+            scenario_match = re.search(
+                r"(?im)^\s*\*\*Scenario:\*\*\s*([A-Za-z_ -]+)\s*$",
+                text,
+            )
+            scenario = scenario_match.group(1).strip().lower() if scenario_match else ""
+            try:
+                from tamas_adapter.loader import (
+                    _add_clean_query_defaults,
+                    _sanitize_impersonation_clean_query,
+                )
+
+                clean_task = _sanitize_impersonation_clean_query(task_body, scenario)
+                clean_task = _add_clean_query_defaults(clean_task, scenario)
+                if clean_task.strip():
+                    return text[:task_match.start(2)] + clean_task.strip() + text[task_match.end(2):]
+            except Exception:
+                pass
+
         start = match.start()
         # 找到冒充声明所在句子的结束位置
         end = match.end()
         # 向前扩展到句子开头
-        while start > 0 and text[start - 1] not in '\n.;':
+        while start > 0 and text[start - 1] not in '\n.;:':
             start -= 1
         # 向后扩展到句子结尾（逗号/句号/换行）
         while end < len(text) and text[end] not in '\n.;':

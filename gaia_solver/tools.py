@@ -6,14 +6,104 @@
 import json
 import os
 import base64
+import re
 import warnings
+from contextvars import ContextVar
+from io import BytesIO
 from typing import Optional
 
 warnings.filterwarnings('ignore', message='.*duckduckgo_search.*')
 warnings.filterwarnings('ignore', message='.*GuessedAtParserWarning.*')
 
-from gaia_solver.config import GAIA_ATTACHMENTS_DIR, WORK_DIR, API_KEY, BASE_URL, get_openai_client, VISION_MODEL
+from gaia_solver.config import GAIA_ATTACHMENTS_DIR, WORK_DIR, get_audio_client, get_openai_client, AUDIO_INPUT_MODE, AUDIO_MODEL, VISION_MODEL
 from token_accounting import token_usage_scope
+
+
+_CURRENT_TOOL_TASK_ID: ContextVar[str] = ContextVar("gaia_current_tool_task_id", default="")
+_IMAGE_ANALYSIS_CACHE: dict[tuple[str, str, int, int], str] = {}
+
+
+def set_tool_task_context(task_id: str):
+    """Bind tool calls to the current MAS task for per-task caching."""
+    return _CURRENT_TOOL_TASK_ID.set(str(task_id or ""))
+
+
+def reset_tool_task_context(token) -> None:
+    _CURRENT_TOOL_TASK_ID.reset(token)
+
+
+def _image_analysis_cache_key(file_path: str) -> tuple[str, str, int, int]:
+    stat = os.stat(file_path)
+    return (
+        _CURRENT_TOOL_TASK_ID.get() or "global",
+        os.path.abspath(file_path),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+    )
+
+
+def _cached_image_analysis_response(cached: str) -> str:
+    cached = str(cached or "").strip()
+    if len(cached) > 1200:
+        cached = cached[:1200].rstrip() + "...(truncated)"
+    return (
+        "CACHED_IMAGE_ANALYSIS: This same image was already analyzed for the current task. "
+        "Do not call analyze_image again for this image; reuse the earlier result.\n"
+        f"{cached}"
+    )
+
+
+WIKI_API_URL = "https://en.wikipedia.org/w/api.php"
+HTTP_HEADERS = {
+    "User-Agent": "GaiaSolver/1.0 (benchmark; contact: local)",
+}
+
+
+def _wiki_api_get(params: dict, timeout: int = 8) -> dict:
+    import requests
+
+    merged = {"format": "json", "formatversion": 2, **params}
+    resp = requests.get(WIKI_API_URL, params=merged, headers=HTTP_HEADERS, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _wiki_search_titles(query: str, limit: int = 3, timeout: int = 8) -> list[str]:
+    data = _wiki_api_get(
+        {
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "srlimit": max(1, min(limit, 10)),
+        },
+        timeout=timeout,
+    )
+    return [
+        str(item.get("title", "")).strip()
+        for item in ((data.get("query") or {}).get("search") or [])
+        if str(item.get("title", "")).strip()
+    ]
+
+
+def _wiki_plain_extract(title: str, chars: int = 5000, timeout: int = 10) -> tuple[str, str]:
+    data = _wiki_api_get(
+        {
+            "action": "query",
+            "prop": "extracts",
+            "explaintext": 1,
+            "exsectionformat": "wiki",
+            "redirects": 1,
+            "titles": title,
+        },
+        timeout=timeout,
+    )
+    pages = (data.get("query") or {}).get("pages") or []
+    if not pages:
+        return title, ""
+    page = pages[0]
+    resolved_title = str(page.get("title") or title)
+    extract = str(page.get("extract") or "")
+    return resolved_title, extract[:chars]
 
 
 # ============================================================
@@ -33,7 +123,7 @@ def search_web(query: str) -> str:
     # 1. DuckDuckGo
     try:
         from ddgs import DDGS
-        ddg_results = list(DDGS().text(query, max_results=5))
+        ddg_results = list(DDGS(timeout=6).text(query, max_results=5))
         for r in ddg_results:
             title = r.get('title', '')
             body = r.get('body', '')[:200]  # 截断摘要
@@ -42,19 +132,15 @@ def search_web(query: str) -> str:
     except Exception as e:
         results_text.append(f"(DuckDuckGo error: {e})")
 
-    # 2. Wikipedia 补充（只取一条精简摘要）
+    # 2. Wikipedia 补充（使用带 timeout 的 MediaWiki API，避免 wikipedia 包同步阻塞）
     try:
-        import wikipedia
-        wikipedia.set_lang('en')
-        search_results = wikipedia.search(query, results=2)
-        if search_results:
-            try:
-                page = wikipedia.page(search_results[0], auto_suggest=False)
-                results_text.append(f"[Wikipedia: {page.title}]\n{page.summary[:1000]}")
-            except (wikipedia.exceptions.DisambiguationError, wikipedia.exceptions.PageError):
-                pass
-    except Exception:
-        pass
+        titles = _wiki_search_titles(query, limit=1, timeout=6)
+        if titles:
+            title, extract = _wiki_plain_extract(titles[0], chars=1000, timeout=8)
+            if extract:
+                results_text.append(f"[Wikipedia: {title}]\n{extract[:1000]}")
+    except Exception as e:
+        results_text.append(f"(Wikipedia API error: {e})")
 
     if not results_text:
         return "No results. Try fetch_webpage with a specific URL."
@@ -155,24 +241,15 @@ def search_wikipedia(topic: str, section: str = "") -> str:
     Returns:
         页面摘要和相关章节内容
     """
-    # 方案 1: 使用 wikipedia 包（更可靠）
+    # 方案 1: 使用带 timeout 的 MediaWiki API，避免 wikipedia 包同步网络调用卡住事件循环
     try:
-        import wikipedia
-        wikipedia.set_lang('en')
-        try:
-            page = wikipedia.page(topic, auto_suggest=True)
-        except wikipedia.exceptions.DisambiguationError as e:
-            # 取消歧义的第一个选项
-            page = wikipedia.page(e.options[0], auto_suggest=False)
-        except wikipedia.exceptions.PageError:
-            # 搜索再试
-            results = wikipedia.search(topic, results=3)
-            if results:
-                page = wikipedia.page(results[0], auto_suggest=False)
-            else:
+        title, content = _wiki_plain_extract(topic, chars=10000, timeout=10)
+        if not content:
+            titles = _wiki_search_titles(topic, limit=3, timeout=8)
+            if not titles:
                 return f"Wikipedia page '{topic}' not found. Try search_web instead."
-        
-        content = page.content
+            title, content = _wiki_plain_extract(titles[0], chars=10000, timeout=10)
+
         if section:
             # 在全文中查找章节
             import re
@@ -189,52 +266,30 @@ def search_wikipedia(topic: str, section: str = "") -> str:
                 # wikipedia 包的 .content 会丢弃 HTML 表格，导致 Discography 等章节为空
                 plain_text = re.sub(r'=+\s*.+?\s*=+', '', section_text).strip()
                 if len(plain_text) < 200:
-                    html_content = _get_wiki_section_from_html(page.title, section)
+                    html_content = _get_wiki_section_from_html(title, section)
                     if html_content and len(html_content) > len(plain_text):
-                        return f"# {page.title} > {section}\n\n{html_content}"
+                        return f"# {title} > {section}\n\n{html_content}"
 
-                return f"# {page.title} > {section}\n\n{section_text}"
+                return f"# {title} > {section}\n\n{section_text}"
             else:
                 # 列出可用章节
                 headings = re.findall(r'==\s*(.+?)\s*==', content)
                 return f"Section '{section}' not found. Available: {', '.join(headings[:20])}"
         
         # 返回全文（限长度）
-        return f"# {page.title}\n\n{content[:5000]}"
+        return f"# {title}\n\n{content[:5000]}"
     except Exception as e:
-        pass
+        api_error = str(e)
     
-    # 方案 2: 使用 wikipediaapi 作为后备
+    # 方案 2: 使用 Wikipedia HTML 抓取作为后备，仍然带 requests timeout
     try:
-        import wikipediaapi
-        wiki = wikipediaapi.Wikipedia('GaiaSolver/1.0 (gaia@example.com)', 'en')
-
-        page = wiki.page(topic.replace(" ", "_"))
-        if not page.exists():
-            alt_topic = topic.replace("_", " ").title().replace(" ", "_")
-            page = wiki.page(alt_topic)
-
-        if not page.exists():
-            return f"Wikipedia page '{topic}' not found. Try search_web instead."
-
         if section:
-            found = _find_section_recursive(page.sections, section)
-            if found:
-                content = f"# {page.title} > {found.title}\n\n{found.text[:5000]}"
-                for sub in found.sections:
-                    content += f"\n\n### {sub.title}\n{sub.text[:2000]}"
-                return content
-            else:
-                all_sections = _list_sections_recursive(page.sections)
-                return f"Section '{section}' not found. Available sections: {', '.join(all_sections)}"
-
-        content_parts = [f"# {page.title}\n\n{page.summary[:3000]}"]
-        total_len = len(content_parts[0])
-        _collect_sections(page.sections, content_parts, total_len, max_total=10000, depth=0)
-
-        return "\n".join(content_parts)
+            html_content = _get_wiki_section_from_html(topic, section)
+            if html_content:
+                return f"# {topic} > {section}\n\n{html_content}"
+        return fetch_webpage(f"https://en.wikipedia.org/wiki/{topic.replace(' ', '_')}")
     except Exception as e:
-        return f"Wikipedia error: {str(e)}"
+        return f"Wikipedia error: API={api_error}; fallback={str(e)}"
 
 
 def _find_section_recursive(sections, target: str):
@@ -823,6 +878,86 @@ def analyze_youtube_video(url: str, question: str) -> str:
 # ============================================================
 # 4. 图片分析工具（使用视觉模型 Doubao-Seed-1.8）
 # ============================================================
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return max(min_value, min(max_value, value))
+
+
+def _prepare_image_for_vision(file_path: str, mime_type: str) -> tuple[str, dict]:
+    """Return base64 image data plus lightweight metadata for the vision prompt."""
+    metadata = {
+        "bytes": os.path.getsize(file_path),
+        "width": None,
+        "height": None,
+        "resized": False,
+        "mime_type": mime_type,
+    }
+    max_side = _env_int("GAIA_VISION_MAX_IMAGE_SIDE", 1800, 512, 4096)
+    max_bytes = _env_int("GAIA_VISION_MAX_IMAGE_BYTES", 4_000_000, 200_000, 20_000_000)
+
+    try:
+        from PIL import Image
+
+        with Image.open(file_path) as img:
+            metadata["width"], metadata["height"] = img.size
+            needs_resize = max(img.size) > max_side or metadata["bytes"] > max_bytes
+            if not needs_resize:
+                with open(file_path, "rb") as f:
+                    return base64.b64encode(f.read()).decode("utf-8"), metadata
+
+            img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+            metadata["width"], metadata["height"] = img.size
+            metadata["resized"] = True
+
+            buf = BytesIO()
+            save_format = "PNG"
+            if mime_type == "image/jpeg":
+                save_format = "JPEG"
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+                img.save(buf, format=save_format, quality=92, optimize=True)
+            else:
+                img.save(buf, format=save_format, optimize=True)
+            return base64.b64encode(buf.getvalue()).decode("utf-8"), metadata
+    except Exception:
+        with open(file_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8"), metadata
+
+
+def _vision_prompt(question: str, metadata: dict) -> str:
+    dimensions = ""
+    if metadata.get("width") and metadata.get("height"):
+        dimensions = f" Image size: {metadata['width']}x{metadata['height']}."
+    return (
+        f"{question}\n\n"
+        "You are analyzing the attached benchmark image to answer the user's exact question."
+        f"{dimensions}\n"
+        "Be concise. Put the final answer first, then only the minimum visual evidence needed.\n"
+        "Use this format exactly:\n"
+        "RESULT: <short final answer>\n"
+        "OBSERVATIONS: <1-3 short bullet-like facts, no long reasoning>\n\n"
+        "General rules:\n"
+        "- If visible text, numbers, formulas, labels, coordinates, or symbols matter, transcribe them exactly.\n"
+        "- For diagrams, boards, grids, charts, maps, and screenshots, respect the visible labels and orientation; do not assume a default orientation.\n"
+        "- If the question asks for a single value, move, label, count, name, or date, RESULT must contain only that value.\n"
+        "- If the image is ambiguous, state the uncertainty briefly in OBSERVATIONS, then give the best-supported RESULT."
+    )
+
+
+def _vision_max_tokens(question: str) -> int:
+    configured = os.environ.get("GAIA_VISION_MAX_TOKENS")
+    if configured:
+        return _env_int("GAIA_VISION_MAX_TOKENS", 1200, 128, 4000)
+    q = str(question or "").lower()
+    verbose_keywords = ("transcribe", "extract", "chart", "table", "all data", "list all", "describe every")
+    if any(keyword in q for keyword in verbose_keywords):
+        return 1800
+    return 1200
+
+
 def analyze_image(file_name: str, question: str) -> str:
     """
     使用视觉模型分析图片，回答关于图片的问题。
@@ -837,24 +972,20 @@ def analyze_image(file_name: str, question: str) -> str:
     file_path = os.path.join(GAIA_ATTACHMENTS_DIR, file_name)
     if not os.path.exists(file_path):
         return f"Error: Image '{file_name}' not found."
+    cache_key = _image_analysis_cache_key(file_path)
+    cached = _IMAGE_ANALYSIS_CACHE.get(cache_key)
+    if cached is not None:
+        return _cached_image_analysis_response(cached)
     try:
-        with open(file_path, "rb") as f:
-            img_data = base64.b64encode(f.read()).decode("utf-8")
-
         # 根据文件扩展名确定 MIME 类型
         ext = file_name.split(".")[-1].lower()
         mime_map = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
         mime_type = mime_map.get(ext, "image/png")
 
-        # 增强 prompt 以获得更精确的回答
-        enhanced_question = (
-            f"{question}\n\n"
-            "IMPORTANT: Be extremely precise and detailed in your analysis. "
-            "If this is a chess position, describe every piece and its exact square. "
-            "If this contains text/numbers, transcribe them exactly as shown. "
-            "If this is a math problem, read every symbol carefully. "
-            "If this is a chart/table, extract all data values precisely."
-        )
+        img_data, metadata = _prepare_image_for_vision(file_path, mime_type)
+        enhanced_question = _vision_prompt(question, metadata)
+        max_tokens = _vision_max_tokens(question)
+        timeout = _env_int("GAIA_VISION_TIMEOUT", 90, 15, 300)
 
         with token_usage_scope("analyze_image.vision"):
             client = get_openai_client()
@@ -875,12 +1006,30 @@ def analyze_image(file_name: str, question: str) -> str:
                         ],
                     }
                 ],
-                max_tokens=4000,
+                max_tokens=max_tokens,
                 temperature=0,
+                timeout=timeout,
             )
-        return response.choices[0].message.content
+        answer = response.choices[0].message.content
+        if answer:
+            if len(_IMAGE_ANALYSIS_CACHE) > 256:
+                _IMAGE_ANALYSIS_CACHE.clear()
+            _IMAGE_ANALYSIS_CACHE[cache_key] = answer
+        return answer
     except Exception as e:
-        return f"Error analyzing image: {str(e)}"
+        err = str(e)
+        if "unknown variant `image_url`" in err or "expected `text`" in err:
+            error_text = (
+                "VISION_UNAVAILABLE: The configured vision provider/model does not support image inputs. "
+                "Set GAIA_VISION_API_KEY, GAIA_VISION_BASE_URL, and GAIA_VISION_MODEL to a vision-capable "
+                f"OpenAI-compatible model. Raw error: {err}"
+            )
+        else:
+            error_text = f"Error analyzing image: {err}"
+        if len(_IMAGE_ANALYSIS_CACHE) > 256:
+            _IMAGE_ANALYSIS_CACHE.clear()
+        _IMAGE_ANALYSIS_CACHE[cache_key] = error_text
+        return error_text
 
 
 # ============================================================
@@ -933,13 +1082,73 @@ def transcribe_audio(file_name: str) -> str:
     if not os.path.exists(file_path):
         return f"Error: Audio file '{file_name}' not found."
 
-    # 方案 1：尝试使用 OpenAI 兼容 API
+    # 方案 1：Doubao-Seed-1.8 等多模态模型通过 chat 接收音频内容
+    if AUDIO_INPUT_MODE == "chat":
+        chat_error = None
+        try:
+            ext = file_name.rsplit(".", 1)[-1].lower()
+            audio_format = "mpeg" if ext == "mp3" else ext
+            mime_map = {
+                "mp3": "audio/mpeg",
+                "mpeg": "audio/mpeg",
+                "wav": "audio/wav",
+                "m4a": "audio/mp4",
+                "mp4": "audio/mp4",
+                "ogg": "audio/ogg",
+                "webm": "audio/webm",
+                "flac": "audio/flac",
+            }
+            mime_type = mime_map.get(ext, "audio/mpeg")
+            with open(file_path, "rb") as f:
+                audio_data = base64.b64encode(f.read()).decode("utf-8")
+
+            prompt = (
+                "Transcribe the attached audio exactly. Preserve names, numbers, "
+                "spelling, and any wording that may be relevant to a short-answer task. "
+                "Return only the transcript."
+            )
+            client = get_audio_client()
+            content_variants = [
+                [
+                    {"type": "text", "text": prompt},
+                    {"type": "input_audio", "input_audio": {"data": audio_data, "format": audio_format}},
+                ],
+                [
+                    {"type": "text", "text": prompt},
+                    {"type": "video_url", "video_url": {"url": f"data:{mime_type};base64,{audio_data}"}},
+                ],
+                [
+                    {"type": "text", "text": prompt},
+                    {"type": "audio_url", "audio_url": {"url": f"data:{mime_type};base64,{audio_data}"}},
+                ],
+            ]
+            for content in content_variants:
+                try:
+                    with token_usage_scope("transcribe_audio.chat"):
+                        response = client.chat.completions.create(
+                            model=AUDIO_MODEL,
+                            messages=[{"role": "user", "content": content}],
+                            max_tokens=2000,
+                            temperature=0,
+                        )
+                    text = response.choices[0].message.content
+                    if text and text.strip():
+                        return text.strip()
+                except Exception as e:
+                    chat_error = e
+                    continue
+        except Exception as e:
+            chat_error = e
+        if chat_error is not None:
+            print(f"[transcribe_audio] multimodal chat failed, falling back: {chat_error}")
+
+    # 方案 2：尝试使用传统 OpenAI 兼容 audio transcription API
     try:
         with token_usage_scope("transcribe_audio.whisper"):
-            client = get_openai_client()
+            client = get_audio_client()
             with open(file_path, "rb") as f:
                 transcript = client.audio.transcriptions.create(
-                    model="whisper-1",
+                    model=AUDIO_MODEL,
                     file=f,
                 )
         if transcript.text and transcript.text.strip():

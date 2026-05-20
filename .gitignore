@@ -25,6 +25,26 @@ gaia_work_dir/
 gaia_data/_hf_cache/
 ffmpeg_bin/
 dashboard_runs/
+diagnostic_runs/
+mas_traces/
+tamas_4mode_full_run/
+tamas_comparison_*/
+benchmark_archive_*/
+benchmark_bad_*/
+
+# ===== Generated benchmark outputs =====
+benchmark_*.jsonl
+gaia_*_*.log
+tamas_*.log
+*.out.log
+*.err.log
+*.pid.txt
+*_results.json
+*_summary.json
+*_selection.json
+*.xlsx
+temp_audio.wav
+gaia_data/attachments/output.wav
 
 # ===== Backup =====
 gaia_solver_autogen_backup/

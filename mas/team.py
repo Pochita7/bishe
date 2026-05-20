@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from agent_framework.openai import OpenAIChatClient
 from .metrics import MetricsCollector, MetricsLogger, TaskMetrics
 from .response_cache import ResponseCache, stable_digest
 from .sentinel import SecurityControlPlane, SecurityEventBus
+from .trace import TraceLogger, extract_tool_calls, response_usage
 from token_accounting import push_tracker, reset_tracker, snapshot_tracker
 
 
@@ -101,6 +103,9 @@ class MASTeam:
         max_tool_calls_per_worker: int = 10,
         security_event_bus: Optional[SecurityEventBus] = None,
         sentinel_control_plane: Optional[SecurityControlPlane] = None,
+        trace_enabled: Optional[bool] = None,
+        trace_dir: Optional[str] = None,
+        trace_run_id: Optional[str] = None,
         **kwargs,
     ):
         self.client = client
@@ -108,14 +113,26 @@ class MASTeam:
         self.verbose = verbose
         self.metrics_logger = metrics_logger
         self.worker_timeout = worker_timeout
+        try:
+            self.media_worker_timeout = int(os.environ.get("MAS_MEDIA_WORKER_TIMEOUT", "300"))
+        except ValueError:
+            self.media_worker_timeout = 300
+        self.media_worker_timeout = max(self.worker_timeout, self.media_worker_timeout)
         self.max_tool_calls_per_worker = max_tool_calls_per_worker
         self.security_event_bus = security_event_bus
         self.sentinel_control_plane = sentinel_control_plane
+        self.trace = TraceLogger.from_env(
+            enabled=trace_enabled,
+            trace_dir=trace_dir,
+            run_id=trace_run_id,
+        )
         self._current_task_id = ""
         self._active_collector: Optional[MetricsCollector] = None
         self._active_external_usage_tracker: Optional[Dict[str, Any]] = None
+        self._active_external_usage_token: Any = None
         self._active_expected_answer = ""
         self._active_planner_rounds = 0
+        self._last_partial_metrics: Optional[TaskMetrics] = None
         self.response_cache = ResponseCache.from_env()
 
         # ---- 构建 Agent 信息摘要 ----
@@ -152,6 +169,64 @@ class MASTeam:
             return value
         return value[:limit] + "...(truncated)"
 
+    @staticmethod
+    def _requested_scale(task: str) -> Optional[Tuple[str, float]]:
+        text = str(task or "").lower()
+        scales = {
+            "thousand": 1_000.0,
+            "million": 1_000_000.0,
+            "billion": 1_000_000_000.0,
+        }
+        patterns = [
+            r"\bhow\s+many\s+(thousand|million|billion)\b",
+            r"\bin\s+(thousands|millions|billions)\b",
+            r"\bnumber\s+of\s+(thousands|millions|billions)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            unit = match.group(1).rstrip("s")
+            if unit in scales:
+                return unit, scales[unit]
+        return None
+
+    @staticmethod
+    def _format_scaled_number(value: float) -> str:
+        rounded = round(value)
+        if abs(value - rounded) < 1e-9:
+            return str(int(rounded))
+        return f"{value:.12g}"
+
+    @classmethod
+    def _normalize_final_answer_for_task(cls, task: str, answer: str, context: str = "") -> str:
+        """Normalize numeric final answers to the unit explicitly requested."""
+        if not answer:
+            return answer
+        scale_request = cls._requested_scale(task)
+        if not scale_request:
+            return answer
+
+        unit, scale = scale_request
+        numeric_tokens = re.findall(
+            r"[-+]?(?:\d+(?:,\d{3})+|\d+)(?:\.\d+)?",
+            str(answer).replace("−", "-"),
+        )
+        if len(numeric_tokens) != 1:
+            return answer
+
+        try:
+            value = float(numeric_tokens[0].replace(",", ""))
+        except ValueError:
+            return answer
+
+        answer_l = str(answer).lower()
+        if unit in answer_l or f"{unit}s" in answer_l:
+            return cls._format_scaled_number(value)
+        if abs(value) >= scale and abs((abs(value) / scale) - round(abs(value) / scale)) < 1e-9:
+            return cls._format_scaled_number(value / scale)
+        return answer
+
     def _publish_security_event(
         self,
         *,
@@ -185,6 +260,30 @@ class MASTeam:
             }
         )
 
+    @staticmethod
+    def _looks_like_image_assignment(task: str, step_desc: str = "") -> bool:
+        text = f"{task}\n{step_desc}".lower()
+        image_markers = (
+            "[image]",
+            "analyze_image",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".gif",
+            "image",
+            "screenshot",
+            "picture",
+            "photo",
+            "visual",
+        )
+        return any(marker in text for marker in image_markers)
+
+    def _timeout_for_worker(self, worker_name: str, task: str = "", step_desc: str = "") -> int:
+        if worker_name == "MediaAnalyst" and self._looks_like_image_assignment(task, step_desc):
+            return self.media_worker_timeout
+        return self.worker_timeout
+
     def _monitor_behavior(
         self,
         *,
@@ -206,6 +305,15 @@ class MASTeam:
             gate=gate,
             decision="allow",
         )
+        self.trace.event(
+            "runtime_monitor",
+            gate=gate,
+            source_agent=source_agent,
+            target=target,
+            behavior_type=behavior_type,
+            decision="allow",
+            params_preview=self._trim_text(safe_params, 1000),
+        )
 
         if not enforce or self.sentinel_control_plane is None:
             return None
@@ -223,6 +331,16 @@ class MASTeam:
                 behavior_type=behavior_type,
                 params=safe_params,
                 gate="SentinelEnforcement",
+                decision="block",
+                reason=str(directive.get("reason", "Blocked by Sentinel")),
+                matched_rules=list(directive.get("matched_rules", [])),
+            )
+            self.trace.event(
+                "runtime_monitor",
+                gate="SentinelEnforcement",
+                source_agent=source_agent,
+                target=target,
+                behavior_type=behavior_type,
                 decision="block",
                 reason=str(directive.get("reason", "Blocked by Sentinel")),
                 matched_rules=list(directive.get("matched_rules", [])),
@@ -674,7 +792,23 @@ class MASTeam:
         """
         agent = self._agents.get(agent_name)
         if not agent:
+            self.trace.event(
+                "agent_error",
+                agent=agent_name,
+                error="unknown agent",
+                prompt_preview=self._trim_text(prompt, 1200),
+            )
             return f"[Error: unknown agent '{agent_name}']", None
+
+        invoke_start = time.time()
+        self.trace.event(
+            "agent_start",
+            agent=agent_name,
+            timeout=timeout,
+            cache_enabled=self.response_cache.enabled,
+            prompt_chars=len(str(prompt or "")),
+            prompt_preview=self._trim_text(prompt, 2000),
+        )
 
         cache_key = ""
         cache_fingerprint: Dict[str, Any] = {}
@@ -699,6 +833,13 @@ class MASTeam:
                     blocked_text = f"[{source} blocked cached response for {agent_name}: {reason}]"
                     if self.verbose:
                         print(f"    [CACHE BLOCKED] {agent_name}: {reason}")
+                    self.trace.event(
+                        "agent_cache_blocked",
+                        agent=agent_name,
+                        elapsed=round(time.time() - invoke_start, 3),
+                        reason=reason,
+                        cache_key=cache_key,
+                    )
                     return (
                         blocked_text,
                         _CachedResponse(
@@ -711,6 +852,17 @@ class MASTeam:
                 if self.verbose:
                     print(f"    [CACHE HIT] {agent_name}")
                 cached_text = str(cached.get("text", ""))
+                self.trace.event(
+                    "agent_end",
+                    agent=agent_name,
+                    elapsed=round(time.time() - invoke_start, 3),
+                    cache_hit=True,
+                    cache_key=cache_key,
+                    output_chars=len(cached_text),
+                    output_preview=self._trim_text(cached_text, 2000),
+                    tool_calls=[{"name": str(name)} for name in tool_names],
+                    usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
                 return (
                     cached_text,
                     _CachedResponse(
@@ -724,24 +876,37 @@ class MASTeam:
         from agent_framework._tools import _token_usage_tracker
         usage_tracker: dict = {'usage': None}
         token = _token_usage_tracker.set(usage_tracker)
-        invoke_start = time.time()
+        tool_context_token = None
+        reset_tool_task_context = None
+        try:
+            from gaia_solver.tools import reset_tool_task_context as _reset_tool_task_context
+            from gaia_solver.tools import set_tool_task_context
+
+            tool_context_token = set_tool_task_context(self._current_task_id or "")
+            reset_tool_task_context = _reset_tool_task_context
+        except Exception:
+            tool_context_token = None
+            reset_tool_task_context = None
 
         try:
             result = await asyncio.wait_for(agent.run(prompt), timeout=timeout)
             text = result.text if hasattr(result, "text") else str(result)
 
             # ---- 工具调用上限检查 ----
-            tool_names: List[str] = []
-            messages = getattr(result, "messages", [])
-            for msg in messages:
-                contents = getattr(msg, "contents", [])
-                for content in contents:
-                    if getattr(content, "type", None) == "function_call":
-                        tool_names.append(str(getattr(content, "name", None) or "unknown"))
+            tool_call_details = extract_tool_calls(result)
+            tool_names: List[str] = [str(item.get("name") or "unknown") for item in tool_call_details]
             tool_count = len(tool_names)
 
             if tool_count > self.max_tool_calls_per_worker and self.verbose:
                 print(f"    [WARN] {agent_name} made {tool_count} tool calls (limit: {self.max_tool_calls_per_worker})")
+            if tool_count > self.max_tool_calls_per_worker:
+                self.trace.event(
+                    "agent_tool_limit_warning",
+                    agent=agent_name,
+                    tool_count=tool_count,
+                    limit=self.max_tool_calls_per_worker,
+                    tool_calls=tool_call_details,
+                )
 
             if cache_key:
                 self.response_cache.put(
@@ -753,6 +918,16 @@ class MASTeam:
                     tool_names=tool_names,
                 )
 
+            self.trace.event(
+                "agent_end",
+                agent=agent_name,
+                elapsed=round(time.time() - invoke_start, 3),
+                cache_hit=False,
+                output_chars=len(text),
+                output_preview=self._trim_text(text, 2000),
+                tool_calls=tool_call_details,
+                usage=response_usage(result),
+            )
             return text, result
         except asyncio.TimeoutError:
             # 超时时，从 tracker 中获取已消耗的 partial token 数据
@@ -763,22 +938,48 @@ class MASTeam:
                 print(f"    [{agent_name}] timeout, partial tokens: in={inp}, out={out}")
             # 构造一个 pseudo-response 以便 record_agent_call 能记录 partial token
             pseudo_resp = _PartialResponse(usage_details=partial_usage)
+            self.trace.event(
+                "agent_timeout",
+                agent=agent_name,
+                elapsed=round(time.time() - invoke_start, 3),
+                timeout=timeout,
+                usage=response_usage(pseudo_resp),
+            )
             return "[Timeout]", pseudo_resp
         except asyncio.CancelledError:
             partial_usage = usage_tracker.get('usage')
+            pseudo_resp = _PartialResponse(usage_details=partial_usage)
             if partial_usage and self._active_collector is not None:
                 self._active_collector.record_agent_call(
                     agent_name,
-                    _PartialResponse(usage_details=partial_usage),
+                    pseudo_resp,
                     time.time() - invoke_start,
                     is_planner=(agent_name == self._planner_name or agent_name == "_Selector"),
                 )
+            self.trace.event(
+                "agent_cancelled",
+                agent=agent_name,
+                elapsed=round(time.time() - invoke_start, 3),
+                usage=response_usage(pseudo_resp),
+            )
             raise
         except Exception as e:
             partial_usage = usage_tracker.get('usage')
             pseudo_resp = _PartialResponse(usage_details=partial_usage) if partial_usage else None
+            self.trace.event(
+                "agent_error",
+                agent=agent_name,
+                elapsed=round(time.time() - invoke_start, 3),
+                error=str(e),
+                usage=response_usage(pseudo_resp),
+            )
             return f"[Error: {e}]", pseudo_resp
         finally:
+            if tool_context_token is not None and reset_tool_task_context is not None:
+                try:
+                    reset_tool_task_context(tool_context_token)
+                except Exception:
+                    pass
             _token_usage_tracker.reset(token)
 
     def get_partial_metrics(
@@ -788,19 +989,60 @@ class MASTeam:
     ) -> Optional[TaskMetrics]:
         """Return metrics collected so far when an outer benchmark timeout cancels run()."""
         if self._active_collector is None:
-            return None
+            return self._last_partial_metrics
+        return self._snapshot_active_metrics(answer=answer, expected_answer=expected_answer)
+
+    def _snapshot_active_metrics(
+        self,
+        answer: str = "",
+        expected_answer: Optional[str] = None,
+    ) -> Optional[TaskMetrics]:
+        if self._active_collector is None:
+            return self._last_partial_metrics
         self._active_collector.sync_external_usage(
             snapshot_tracker(self._active_external_usage_tracker)
         )
-        return self._active_collector.finalize(
+        metrics = self._active_collector.finalize(
             answer=answer,
             expected_answer=self._active_expected_answer if expected_answer is None else expected_answer,
             rounds=self._active_planner_rounds,
         )
+        self._last_partial_metrics = metrics
+        return metrics
+
+    def _clear_active_metrics_state(self) -> None:
+        if self._active_external_usage_token is not None:
+            try:
+                reset_tracker(self._active_external_usage_token)
+            except Exception:
+                pass
+        self._active_external_usage_token = None
+        self._active_external_usage_tracker = None
+        self._active_collector = None
+        self._active_expected_answer = ""
+        self._active_planner_rounds = 0
 
     # --------------------------------------------------------
     # 并行分组
     # --------------------------------------------------------
+
+    @staticmethod
+    def _step_depends_on_previous(step_desc: str) -> bool:
+        text = str(step_desc or "").lower()
+        dependency_patterns = [
+            r"\busing\s+(?:the\s+)?(?:results?|data|information|findings)\b",
+            r"\buse\s+(?:the\s+)?(?:results?|data|information|findings|extracted)\b",
+            r"\bwith\s+(?:the\s+)?(?:results?|data|information|findings|extracted)\b",
+            r"\bbased\s+on\s+(?:the\s+)?(?:results?|data|information|findings|extracted)\b",
+            r"\bfrom\s+(?:the\s+)?(?:search\s+results?|results?|data|information|findings|extracted)\b",
+            r"\bfrom\s+(?:step|the\s+previous|above)\b",
+            r"\bafter\s+(?:that|the|receiving|getting|finding)\b",
+            r"\bonce\s+(?:the|you|we)\b",
+            r"\bif\s+found\b",
+            r"\bthen\b",
+            r"\bextracted\s+data\b",
+        ]
+        return any(re.search(pattern, text) for pattern in dependency_patterns)
 
     @staticmethod
     def _group_steps_for_parallel(
@@ -823,7 +1065,8 @@ class MASTeam:
         workers_in_group: set = set()
 
         for desc, worker in steps:
-            if worker in workers_in_group:
+            depends_on_previous = bool(current_group) and MASTeam._step_depends_on_previous(desc)
+            if worker in workers_in_group or depends_on_previous:
                 # 同一 Worker 出现两次 → 当前组结束，开新组
                 groups.append(current_group)
                 current_group = [(desc, worker)]
@@ -865,6 +1108,13 @@ class MASTeam:
 
             handoff_count += 1
             collector.record_handoff(worker_name, target_name, handoff_task)
+            self.trace.event(
+                "handoff_detected",
+                from_agent=worker_name,
+                to_agent=target_name,
+                handoff_index=handoff_count,
+                task_preview=self._trim_text(handoff_task, 1000),
+            )
             self._publish_security_event(
                 source_agent=worker_name,
                 target=target_name,
@@ -903,9 +1153,10 @@ class MASTeam:
             )
             history[:] = self._sanitize_context(history, label="handoff_history")
             handoff_prompt = self._build_worker_prompt(task, handoff_task, worker_results)
+            handoff_timeout = self._timeout_for_worker(target_name, task, handoff_task)
             t0 = time.time()
             worker_text, worker_resp = await self._invoke_agent(
-                target_name, handoff_prompt, timeout=timeout
+                target_name, handoff_prompt, timeout=handoff_timeout
             )
             collector.record_agent_call(
                 target_name, worker_resp, time.time() - t0, is_planner=False
@@ -951,6 +1202,14 @@ class MASTeam:
 
             history.append({"source": target_name, "content": worker_text})
             worker_results.append((target_name, worker_text))
+            self.trace.event(
+                "handoff_result",
+                from_agent=worker_name,
+                worker=target_name,
+                handoff_index=handoff_count,
+                result_chars=len(worker_text),
+                result_preview=self._trim_text(worker_text, 2000),
+            )
 
             if self.verbose:
                 preview = worker_text[:200].replace("\n", " ")
@@ -968,7 +1227,9 @@ class MASTeam:
             f"Task: {task}\n\n"
             "Create a PLAN to accomplish this task. "
             "Use as FEW steps as possible (1-2 preferred). "
-            "Steps with DIFFERENT workers can run in parallel."
+            "Steps with DIFFERENT workers can run in parallel. "
+            "If the task asks for a scaled unit such as 'how many thousand hours', "
+            "make the plan compute and return the scaled answer value, not only the raw unit value."
         )
 
     def _build_planner_review_prompt(
@@ -986,6 +1247,8 @@ class MASTeam:
         parts.append(
             "\n\nIMPORTANT: You MUST output FINAL_ANSWER if ANY worker found relevant data.\n"
             "Even partial or approximate data is enough — extract the best answer NOW.\n"
+            "Before finalizing, re-read the task's requested unit. If it asks for 'how many thousand/million/billion X', "
+            "convert any raw X value into that requested scaled number.\n"
             "Output FINAL_ANSWER: <answer>\n"
             "ONLY create a NEW PLAN (max 2 steps) if workers found ZERO relevant information."
         )
@@ -1006,11 +1269,18 @@ class MASTeam:
             for name, text in prior_results[-2:]:
                 truncated = text[:500] + "..." if len(text) > 500 else text
                 parts.append(f"  [{name}]: {truncated}")
+        else:
+            parts.append("Previous results: none")
         parts.append(
             "\nExecute your assignment using your tools. "
             "Be efficient — use minimum tool calls needed. "
+            "Do not narrate hidden reasoning or step-by-step deliberation; return only concise evidence and the answer. "
+            "If a tool already provides a RESULT, use it directly and do not call the same tool again. "
             "When done, summarize the KEY DATA you found and say RESULT: <your findings>.\n"
-            "If the task asks 'how many', COUNT the items and include the number in RESULT."
+            "If the task asks 'how many', COUNT the items and include the number in RESULT.\n"
+            "If the task asks for a scaled unit such as thousand/million/billion, include both the raw value and the requested scaled value.\n"
+            "If your assignment depends on previous/extracted data and Previous results is none or only [Timeout], do NOT guess; "
+            "say what data is missing and add a HANDOFF to the worker that can obtain it."
         )
         return "\n".join(parts)
 
@@ -1019,6 +1289,28 @@ class MASTeam:
     # --------------------------------------------------------
 
     async def run(
+        self,
+        task: str,
+        task_id: str = "",
+        expected_answer: str = "",
+    ) -> Dict[str, Any]:
+        self._last_partial_metrics = None
+        try:
+            return await self._run_impl(
+                task=task,
+                task_id=task_id,
+                expected_answer=expected_answer,
+            )
+        except asyncio.CancelledError:
+            self._snapshot_active_metrics(answer="TIMEOUT", expected_answer=expected_answer)
+            raise
+        except Exception:
+            self._snapshot_active_metrics(answer="ERROR", expected_answer=expected_answer)
+            raise
+        finally:
+            self._clear_active_metrics_state()
+
+    async def _run_impl(
         self,
         task: str,
         task_id: str = "",
@@ -1046,6 +1338,7 @@ class MASTeam:
         """
         start = time.time()
         self._current_task_id = task_id or f"session-{int(start * 1000)}"
+        self.trace.start_task(self._current_task_id, task)
         guardian = getattr(self, "guardian", None)
         if guardian is not None and hasattr(guardian, "set_current_task_id"):
             guardian.set_current_task_id(self._current_task_id)
@@ -1060,6 +1353,7 @@ class MASTeam:
         collector = MetricsCollector(task_id=task_id, task=task)
         self._active_collector = collector
         external_usage_token, external_usage_tracker = push_tracker()
+        self._active_external_usage_token = external_usage_token
         self._active_external_usage_tracker = external_usage_tracker
         self._active_expected_answer = expected_answer
         self._active_planner_rounds = 0
@@ -1161,6 +1455,13 @@ class MASTeam:
             decision=task_input_decision,
             reason=task_input_reason,
             matched_rules=task_input_rules,
+        )
+        self.trace.event(
+            "task_input_review",
+            decision=task_input_decision,
+            reason=task_input_reason,
+            matched_rules=task_input_rules,
+            task_preview=self._trim_text(task, 1200),
         )
 
         last_plan_text = ""
@@ -1289,6 +1590,15 @@ class MASTeam:
 
             # ========== 2. 解析 PLAN → Worker 步骤列表 ==========
             steps = self._parse_plan(planner_text)
+            self.trace.event(
+                "plan_parsed",
+                round=round_num + 1,
+                parsed_steps=[
+                    {"worker": worker, "step": self._trim_text(desc, 800)}
+                    for desc, worker in steps
+                ],
+                raw_plan_preview=self._trim_text(planner_text, 2000),
+            )
 
             if not steps:
                 if self.verbose:
@@ -1305,7 +1615,6 @@ class MASTeam:
             # ========== 3. 按组调度 Workers（独立步骤并行，支持 HANDOFF）==========
             worker_results = []
             max_handoffs = 2  # 每步最大链式次数，防止无限循环
-            wk_timeout = self.worker_timeout
 
             # ---- 分组: 同一 Worker 的步骤串行，不同 Worker 的步骤并行 ----
             parallel_groups = self._group_steps_for_parallel(steps)
@@ -1365,8 +1674,21 @@ class MASTeam:
                     )
                     history = self._sanitize_context(history, label="worker_prompt_history")
                     worker_prompt = self._build_worker_prompt(task, step_desc, worker_results)
+                    worker_timeout = self._timeout_for_worker(worker_name, task, step_desc)
+                    self.trace.event(
+                        "worker_dispatch",
+                        round=round_num + 1,
+                        worker=worker_name,
+                        timeout=worker_timeout,
+                        step_preview=self._trim_text(step_desc, 1000),
+                        prior_result_count=len(worker_results),
+                    )
                     t0 = time.time()
-                    worker_text, worker_resp = await self._invoke_agent(worker_name, worker_prompt, timeout=wk_timeout)
+                    worker_text, worker_resp = await self._invoke_agent(
+                        worker_name,
+                        worker_prompt,
+                        timeout=worker_timeout,
+                    )
                     collector.record_agent_call(
                         worker_name, worker_resp, time.time() - t0, is_planner=False
                     )
@@ -1411,6 +1733,15 @@ class MASTeam:
 
                     history.append({"source": worker_name, "content": worker_text})
                     worker_results.append((worker_name, worker_text))
+                    self.trace.event(
+                        "worker_result",
+                        round=round_num + 1,
+                        worker=worker_name,
+                        output_action=output_action,
+                        output_reason=output_reason,
+                        result_chars=len(worker_text),
+                        result_preview=self._trim_text(worker_text, 2000),
+                    )
 
                     if self.verbose:
                         preview = worker_text[:200].replace("\n", " ")
@@ -1419,7 +1750,7 @@ class MASTeam:
                     # HANDOFF 链式协作
                     await self._process_handoffs(
                         task, worker_name, worker_text, worker_results,
-                        history, collector, max_handoffs, wk_timeout
+                        history, collector, max_handoffs, worker_timeout
                     )
                 else:
                     # 多步并行执行
@@ -1466,8 +1797,18 @@ class MASTeam:
                             label="parallel_worker_prompt_results",
                         )
                         prompt = self._build_worker_prompt(task, desc, prompt_results)
+                        step_timeout = self._timeout_for_worker(wname, task, desc)
+                        self.trace.event(
+                            "worker_dispatch",
+                            round=round_num + 1,
+                            worker=wname,
+                            parallel_group_size=len(group),
+                            timeout=step_timeout,
+                            step_preview=self._trim_text(desc, 1000),
+                            prior_result_count=len(prompt_results),
+                        )
                         t0 = time.time()
-                        text, resp = await self._invoke_agent(wname, prompt, timeout=wk_timeout)
+                        text, resp = await self._invoke_agent(wname, prompt, timeout=step_timeout)
                         elapsed_s = time.time() - t0
                         if resp is not None:
                             collector.record_agent_call(wname, resp, elapsed_s, is_planner=False)
@@ -1513,6 +1854,14 @@ class MASTeam:
 
                         history.append({"source": wname, "content": wtext})
                         worker_results.append((wname, wtext))
+                        self.trace.event(
+                            "worker_result",
+                            round=round_num + 1,
+                            worker=wname,
+                            elapsed=round(welapsed, 3),
+                            result_chars=len(wtext),
+                            result_preview=self._trim_text(wtext, 2000),
+                        )
                         if self.verbose:
                             preview = wtext[:200].replace("\n", " ")
                             print(f"    [{wname}]: {preview}")
@@ -1520,7 +1869,7 @@ class MASTeam:
                         # HANDOFF
                         await self._process_handoffs(
                             task, wname, wtext, worker_results,
-                            history, collector, max_handoffs, wk_timeout
+                            history, collector, max_handoffs, self._timeout_for_worker(wname, task, "")
                         )
 
             # ========== 4. Planner 审查结果 ==========
@@ -1697,18 +2046,29 @@ class MASTeam:
                 preview = forced[:300].replace("\n", " ")
                 print(f"  [{self._planner_name}] forced: {preview}")
 
+        normalization_context = "\n".join(text for _, text in worker_results[-4:])
+        normalized_answer = self._normalize_final_answer_for_task(
+            task,
+            final_answer or "",
+            context=normalization_context,
+        )
+        if normalized_answer != (final_answer or ""):
+            if self.verbose:
+                print(f"  [MASTeam] normalized final answer: {final_answer} -> {normalized_answer}")
+            self.trace.event(
+                "final_answer_normalized",
+                before=final_answer or "",
+                after=normalized_answer,
+            )
+            final_answer = normalized_answer
+
         elapsed = time.time() - start
 
         # ---- 生成 TaskMetrics ----
-        collector.sync_external_usage(snapshot_tracker(external_usage_tracker))
-        metrics = collector.finalize(
+        metrics = self._snapshot_active_metrics(
             answer=final_answer or "",
             expected_answer=expected_answer,
-            rounds=planner_rounds,
         )
-        reset_tracker(external_usage_token)
-        self._active_external_usage_tracker = None
-        self._active_collector = None
 
         # ---- 自动持久化 ----
         if self.metrics_logger:
@@ -1724,6 +2084,15 @@ class MASTeam:
             if hasattr(self, "sentinel") and getattr(self, "sentinel", None) is not None:
                 print(f"  Sentinel: {getattr(self, 'sentinel').status}")
 
+        self.trace.event(
+            "task_end",
+            elapsed=round(elapsed, 3),
+            final_answer=final_answer or "",
+            turns=len(history),
+            rounds=planner_rounds,
+            metrics=metrics.to_dict() if hasattr(metrics, "to_dict") else {},
+        )
+
         return {
             "answer": final_answer or "",
             "messages": history,
@@ -1733,6 +2102,7 @@ class MASTeam:
             "metrics": metrics,
             "sentinel_status": getattr(getattr(self, "sentinel", None), "status", None),
             "response_cache": self.response_cache.stats(),
+            "trace_file": getattr(self.trace, "file_path", ""),
         }
 
     # --------------------------------------------------------

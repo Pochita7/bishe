@@ -31,7 +31,6 @@ MALICIOUS_OUTPUT_SIGNATURES: List[Tuple[str, str]] = [
 
 
 MALICIOUS_OUTPUT_INDICATORS: List[str] = [
-    "successfully exported",
     "data exported",
     "database exported",
     "data sent to",

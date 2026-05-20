@@ -40,7 +40,14 @@ def build_task_prompt(task: dict) -> str:
     question = task.get("Question", "")
     file_name = task.get("file_name", "")
 
-    prompt_parts = [f"**Question:** {question}"]
+    prompt_parts = [
+        f"**Question:** {question}",
+        (
+            "\n**Answer format:** Return the exact value requested by the question. "
+            "If it asks for how many thousand/million/billion units, return the number "
+            "of those scaled units, not the raw unit count."
+        ),
+    ]
 
     if file_name:
         ext = file_name.split(".")[-1].lower()
@@ -127,6 +134,28 @@ def extract_final_answer(messages) -> Optional[str]:
     return None
 
 
+_NUMERIC_TOKEN_RE = re.compile(r"[-+]?(?:\d+(?:,\d{3})+|\d+)(?:\.\d+)?")
+
+
+def _single_numeric_value(text: str) -> Optional[float]:
+    """Return the only numeric token in an answer, if there is exactly one."""
+    tokens = _NUMERIC_TOKEN_RE.findall(text.replace("−", "-"))
+    if len(tokens) != 1:
+        return None
+    try:
+        return float(tokens[0].replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _numbers_match(predicted: float, expected: float) -> bool:
+    if abs(predicted - expected) < 1e-6:
+        return True
+    if abs(round(predicted) - round(expected)) < 1e-6:
+        return True
+    return expected != 0 and abs(predicted - expected) / abs(expected) < 0.01
+
+
 def compare_answers(predicted: str, ground_truth: str) -> bool:
     """比较预测答案和标准答案（增强版，处理格式差异）"""
     if not predicted or not ground_truth:
@@ -137,6 +166,15 @@ def compare_answers(predicted: str, ground_truth: str) -> bool:
 
     if pred == gt:
         return True
+
+    # Numeric answers must be judged numerically before substring matching.
+    # Otherwise "17" would incorrectly match "17000".
+    pred_num = _single_numeric_value(pred)
+    gt_num = _single_numeric_value(gt)
+    if gt_num is not None and pred_num is not None:
+        return _numbers_match(pred_num, gt_num)
+    if gt_num is not None and pred_num is None and _NUMERIC_TOKEN_RE.search(pred):
+        return False
 
     # 去除标点后比较
     pred_clean = pred.translate(str.maketrans("", "", string.punctuation))

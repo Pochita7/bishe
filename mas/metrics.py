@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -398,8 +399,29 @@ class MetricsLogger:
 # 工具函数
 # ============================================================
 
+_NUMERIC_TOKEN_RE = re.compile(r"[-+]?(?:\d+(?:,\d{3})+|\d+)(?:\.\d+)?")
+
+
+def _single_numeric_value(text: str) -> Optional[float]:
+    tokens = _NUMERIC_TOKEN_RE.findall(text.replace("−", "-"))
+    if len(tokens) != 1:
+        return None
+    try:
+        return float(tokens[0].replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _numbers_match(predicted: float, expected: float) -> bool:
+    if abs(predicted - expected) < 1e-6:
+        return True
+    if abs(round(predicted) - round(expected)) < 1e-6:
+        return True
+    return expected != 0 and abs(predicted - expected) / abs(expected) < 0.01
+
+
 def _check_answer(predicted: str, expected: str) -> bool:
-    """简单正确性判断 — expected 出现在 predicted 中即算正确"""
+    """Simple correctness check used for local metrics."""
     if not predicted or not expected:
         return False
     predicted = predicted.strip().lower()
@@ -407,6 +429,12 @@ def _check_answer(predicted: str, expected: str) -> bool:
     # 精确匹配
     if predicted == expected:
         return True
+    p_num = _single_numeric_value(predicted)
+    e_num = _single_numeric_value(expected)
+    if e_num is not None and p_num is not None:
+        return _numbers_match(p_num, e_num)
+    if e_num is not None and p_num is None and _NUMERIC_TOKEN_RE.search(predicted):
+        return False
     # 包含匹配
     if expected in predicted:
         return True

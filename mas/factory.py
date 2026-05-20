@@ -75,6 +75,8 @@ FINAL_ANSWER formatting rules (CRITICAL):
 EFFICIENCY Rules (CRITICAL — follow these to avoid wasting time):
 - MINIMIZE steps. Prefer 1-2 steps max. Only add more if truly necessary.
 - Steps assigned to DIFFERENT workers will run IN PARALLEL — plan for parallelism.
+- Only make parallel steps when they are truly independent. If one step says using/based on/extracted/from step/if found,
+  it depends on previous data and must be placed after the data-gathering step.
 - Be VERY specific in each step description so Workers don't need to guess.
 - When reviewing results, EXTRACT the answer immediately if present. Don't ask for more work unless the answer is genuinely missing.
 - If the question asks "how many thousand X", the answer should be the NUMBER of thousands, NOT the raw number (e.g., 17, not 17000).
@@ -91,6 +93,7 @@ CRITICAL Rules:
 - Excel / Word / PPT / text files → Assign: FileReader
 - General web search → Assign: WebSearcher
 - Reading specific URLs / dynamic pages → Assign: WebBrowser
+- Wikipedia questions -> prefer WebSearcher/search_wikipedia. Do NOT use WebBrowser for Wikipedia unless WebSearcher explicitly says a specific URL must be opened.
 - Max 3 steps per plan. Be specific about what each Worker should do.
 - Numbers: no units unless asked. Names: name only.
 - Lists: comma+space separated.
@@ -189,6 +192,9 @@ def create_gaia_team(
     metrics_logger: Optional[MetricsLogger] = None,
     worker_timeout: int = 120,
     max_tool_calls_per_worker: int = 10,
+    trace_enabled: Optional[bool] = None,
+    trace_dir: Optional[str] = None,
+    trace_run_id: Optional[str] = None,
 ) -> MASTeam:
     """
     创建 GAIA benchmark 测试团队。
@@ -258,6 +264,9 @@ def create_gaia_team(
         max_tool_calls_per_worker=max_tool_calls_per_worker,
         security_event_bus=security_event_bus,
         sentinel_control_plane=sentinel_control_plane,
+        trace_enabled=trace_enabled,
+        trace_dir=trace_dir,
+        trace_run_id=trace_run_id,
     )
 
     if enable_sentinel:
@@ -295,6 +304,9 @@ def create_tamas_team(
     metrics_logger: Optional[MetricsLogger] = None,
     worker_timeout: int = 90,
     max_tool_calls_per_worker: int = 8,
+    trace_enabled: Optional[bool] = None,
+    trace_dir: Optional[str] = None,
+    trace_run_id: Optional[str] = None,
 ) -> MASTeam:
     """
     创建 TAMAS 安全测试团队。
@@ -423,6 +435,9 @@ def create_tamas_team(
         max_tool_calls_per_worker=max_tool_calls_per_worker,
         security_event_bus=security_event_bus,
         sentinel_control_plane=sentinel_control_plane,
+        trace_enabled=trace_enabled,
+        trace_dir=trace_dir,
+        trace_run_id=trace_run_id,
     )
 
     if enable_sentinel:
